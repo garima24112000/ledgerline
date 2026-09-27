@@ -1,4 +1,29 @@
+# Secrets / local infra state
 .env
 *.tfstate*
 .terraform/
 out.json
+
+# Maven / Java
+target/
+*.class
+*.jar
+!.mvn/wrapper/maven-wrapper.jar
+hs_err_pid*
+replay_pid*
+
+# Logs
+*.log
+logs/
+
+# IDEs
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+.factorypath
+
+# OS
+.DS_Store

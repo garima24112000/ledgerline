@@ -1,0 +1,2 @@
+-- V1: baseline. Intentionally empty; schema (accounts, journal_entries, postings, outbox)
+-- arrives in later migrations.

@@ -31,8 +31,8 @@ class GatewayApiApplicationIT {
     private Flyway flyway;
 
     @Test
-    void flywayAppliesBaselineMigration() {
-        assertThat(flyway.info().current().getVersion().getVersion()).isEqualTo("1");
+    void flywayAppliesAllMigrations() {
+        assertThat(flyway.info().current().getVersion().getVersion()).isEqualTo("2");
     }
 
     @Test

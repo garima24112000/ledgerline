@@ -280,6 +280,163 @@ can make it cheaper. Measured: unbalanced-entry check 274 ms (the planner walks
 acceptable for an operator endpoint or nightly job. At a much larger scale, verification would run
 incrementally (only entries since the last checkpoint) or on a read replica.
 
+### Why it's built this way (interview notes)
+
+#### Why double-entry?
+Single-entry bookkeeping is `merchant.balance += 9800`. If a bug skips the fee credit, or credits
+twice, nothing notices: the number is just wrong, and there is no history to explain it.
+
+Double-entry records every movement as a journal entry whose debits equal its credits. Money is
+never created or destroyed, only moved between accounts. That gives three things:
+1. **A built-in checksum.** All balances must sum to 0. Any code path that "forgets the other side"
+   breaks this and `/verify` catches it.
+2. **An audit trail.** The postings *are* the history. Every balance can be recomputed and
+   explained line by line ("why is this merchant owed ₹98?" → these postings).
+3. **Immutability.** Mistakes are fixed with a reversing entry, never by editing. The past stays
+   true, which is what auditors, reconciliation with the bank, and disputes need.
+
+The cached balance is an optimisation on top. The postings are the source of truth.
+
+#### Why a deferred constraint trigger instead of (only) a Java check?
+- **A Java check protects one code path; the database protects all of them.** Raw SQL fixes in
+  `psql`, a future second service, a data migration, a refactor that bypasses `LedgerService`: none
+  of them go through the Java check. The trigger applies to every writer. The Java check is still
+  there, for a fast, clear error and a unit-testable rule.
+- **Why a trigger, not a `CHECK`:** a `CHECK` constraint only sees the row being written.
+  "Debits = credits" is a rule across many rows. The SQL standard's `CREATE ASSERTION` would express
+  it, but Postgres doesn't implement it. A constraint trigger is the Postgres way to get a
+  cross-row constraint.
+- **Why deferred:** an entry is written with several `INSERT`s (entry, then each posting). After the
+  first posting it is unbalanced *by construction*, so an immediate check would reject every valid
+  entry. `DEFERRABLE INITIALLY DEFERRED` runs the check at `COMMIT`, when the entry is complete. If
+  it fails, the whole transaction rolls back, including the balance updates.
+
+#### Why lock rows in id order?
+A deadlock needs a cycle: T1 holds A and waits for B, while T2 holds B and waits for A. Postgres
+detects it after `deadlock_timeout` (1 s by default) and aborts one transaction with `40P01`. That
+means a failed payment and a one-second latency spike.
+
+If every transaction acquires locks in the same global order (ascending account id), a cycle is
+impossible. A transaction only ever waits for a lock with a *higher* id than every lock it holds, so
+the wait-for chain can't loop back. Reproduced on Postgres 16, with two transactions updating accounts
+1 and 2:
+
+| Lock order | Result |
+|---|---|
+| T1: 1 then 2, T2: 2 then 1 | T1 aborted: `ERROR: deadlock detected` |
+| Both: 1 then 2 | T2 waits for T1, then both commit |
+
+Details that come up in interviews:
+- The order only protects you if **every** code path follows it, including refunds and payouts.
+  That's why locking is one explicit step in `LedgerService.post`, not scattered updates.
+- `ORDER BY id ... FOR UPDATE` locks rows in output order. Postgres warns that rows can come back
+  out of order if the sort key changes while waiting. `id` never changes, so that can't happen here.
+- Taking all locks **up front, before any writes** also means no work is thrown away halfway if a
+  lock can't be taken.
+- `FOR NO KEY UPDATE` would be a slightly weaker, sufficient lock, because we never change the key.
+  It doesn't block other transactions' FK checks (`FOR KEY SHARE`) from inserting postings that
+  reference the account. Since every writer here locks first anyway, `FOR UPDATE` is kept for clarity.
+
+#### What would break with READ COMMITTED and no `FOR UPDATE`?
+In READ COMMITTED (the Postgres default, and what `post()` runs in), **each statement** sees a new
+snapshot of committed data. Measured on Postgres 16, with two concurrent transactions each adding
+9,800 to a balance of 0:
+
+| Pattern | Final balance | Why |
+|---|---|---|
+| App reads balance, computes, writes `balance = :value` | **9,800** (lost update) | Both read 0, both write 9,800. The second write overwrites the first. |
+| `UPDATE SET balance = balance + 9800` (what `post()` does) | 19,600 ✓ | The second `UPDATE` waits for the row lock, then **re-evaluates against the newly committed row** before applying `+ 9800`. |
+| Read with `FOR UPDATE`, compute, write | 19,600 ✓ | The second reader waits for the lock and then reads the committed 9,800. |
+
+So in *today's* code, removing `FOR UPDATE` would **not** lose balance updates, because the atomic
+increment is safe on its own. What breaks is anything that **reads, decides, then writes**:
+- **Refund limits** ("total refunds ≤ captured amount"). Two refunds of ₹60 on a ₹100 capture each
+  read "refunded so far = 0", each pass the check, and both insert. The measured result is 120
+  refunded. Neither transaction updated a row the other read, so nothing conflicts.
+- **Funds checks** ("merchant has enough for this payout"). The `balance >= 0` CHECK still stops a
+  negative balance, but the user gets a constraint-violation error instead of a clean
+  "insufficient funds", and rules that aren't single-row CHECKs aren't protected at all.
+- **Deadlock safety becomes accidental.** It depends on the update loop happening to iterate in id
+  order, instead of being a deliberate step.
+- A read-modify-write in Java (loading the `Account` entity, `setBalance`, save) would lose
+  updates outright. `/verify` would report the account as mismatched, because the postings would
+  still sum correctly.
+
+The fix for the refund race under READ COMMITTED is to lock a common parent row (the payment, or the
+merchant's account) `FOR UPDATE` **before** reading the refund total. Measured result: 60 refunded,
+and the second refund is rejected. It works because after waiting for the lock, READ COMMITTED's
+*next statement* takes a fresh snapshot that includes the first refund.
+
+#### READ COMMITTED vs REPEATABLE READ vs SERIALIZABLE in Postgres
+All three results below were reproduced with two concurrent `psql` sessions on Postgres 16.
+
+| Level | Snapshot | Lost update (read-modify-write) | Write skew (refund race) | Must retry on `40001`? |
+|---|---|---|---|---|
+| READ COMMITTED | New one per **statement** | **Happens** (9,800 instead of 19,600) | **Happens** (120 refunded) | No |
+| REPEATABLE READ | One per **transaction** (snapshot isolation) | Prevented: second writer gets `could not serialize access due to concurrent update` | **Happens** (120 refunded) | Yes |
+| SERIALIZABLE | One per transaction + conflict detection (SSI) | Prevented | Prevented: second gets `could not serialize access due to read/write dependencies among transactions` (60 refunded) | Yes |
+
+- **READ COMMITTED.** No transaction-wide snapshot, so two reads in one transaction can disagree
+  (non-repeatable reads, phantoms). Concurrent writers to the same row are serialized by the row lock
+  and re-evaluate their `WHERE`/`SET` against the latest version. Correctness for read-then-write
+  logic needs explicit locks.
+- **REPEATABLE READ.** Every statement sees the snapshot taken at the transaction's first
+  statement. In Postgres this also prevents phantoms, which is stronger than the SQL standard
+  requires. If you try to update or lock a row that someone else changed and committed after your
+  snapshot, you get `40001` instead of silently overwriting. So lost updates become errors. **Write
+  skew still gets through:** each transaction reads the same data, then writes *different* rows (two
+  new refund rows), so there is no write-write conflict to detect.
+- **SERIALIZABLE.** Adds predicate locks ("SIRead" locks) that track what each transaction *read*.
+  If transaction A read something that B then wrote, and B read something that A then wrote, that's a
+  dangerous cycle, and Postgres aborts one of them. It's the only level where "each transaction is
+  correct alone ⇒ correct together" holds with no manual locking. The costs: you must retry
+  `40001`; there are false positives (sequential scans take relation-level predicate locks and
+  conflict more, so good indexes matter); and there's memory overhead for predicate locks.
+
+**Surprise found while measuring:** under REPEATABLE READ, locking the parent row first did **not**
+fix the refund race. The result was still 120. T2's snapshot was taken by its first statement
+(the `FOR UPDATE`) *before* T1 committed. When T1 committed, T2 got the lock, but T1 had only locked
+the row, not updated it, so there was no conflict to raise, and T2's `SUM` still read its old
+snapshot. The "lock the parent row" pattern relies on READ COMMITTED's per-statement snapshot. Under
+REPEATABLE READ, the parent row must actually be *updated* (then the second transaction gets
+`40001`), or you use SERIALIZABLE. In this ledger, every refund would `UPDATE` the merchant account's
+balance, so REPEATABLE READ would raise `40001` there. But that protection would be a side effect
+of the balance update, and it's better not to rely on it.
+
+**What Ledgerline uses:** READ COMMITTED + explicit `FOR UPDATE` in a fixed order for money
+movement. It needs no retry loop, the behaviour is easy to reason about, and on hot rows blocking is
+cheaper than repeated aborts. `/verify` uses REPEATABLE READ, because it's read-only and only needs
+one consistent snapshot across its three queries.
+
+#### Optimistic (`@Version`) vs pessimistic (`FOR UPDATE`) locking
+- **Optimistic:** no lock is held while working. The write is
+  `UPDATE ... SET ..., version = version + 1 WHERE id = ? AND version = ?`. If 0 rows are affected,
+  someone else got there first, and JPA throws `OptimisticLockException`. You then retry or return
+  `409 Conflict`.
+- **Pessimistic:** take the row lock before reading. Others wait instead of failing.
+
+| Pick optimistic when | Pick pessimistic when |
+|---|---|
+| Conflicts are **rare** (different users editing different things) | Conflicts are **common**: hot rows like `PLATFORM_FEES`, which every capture touches |
+| The "transaction" spans **user think time** or several HTTP requests. You can't hold a DB lock while someone edits a form | The critical section is **short** and entirely inside one DB transaction |
+| Failing with "someone else changed this, reload" is an acceptable answer | The operation **must succeed** and retries are costly or have side effects |
+| Reads vastly outnumber writes | You need to read-then-decide on current data (funds and limit checks) |
+
+Why not optimistic for the ledger: with 50 concurrent captures on the same accounts, only one
+wins each round and the other 49 retry. That's roughly n² attempts, the retry storm gets worse
+exactly when load is highest, and each retry re-runs the whole transaction. Pessimistic locking
+queues them instead: each waits once, and all 50 succeed.
+
+The costs of pessimistic locking: waiting holds a pooled connection, and a slow lock holder
+stalls everyone behind it. So **never hold a row lock across a network call**. The call to
+mock-bank happens *before* the ledger transaction, never inside it. Keep the locked section to a
+few milliseconds of SQL.
+
+In this project: the ledger uses pessimistic locking. `Account` still carries `@Version`, so any
+future JPA edit of an account (such as toggling `allow_negative`) fails loudly instead of
+overwriting a concurrent change. Merchant profile edits (webhook URL, tier) are the textbook
+optimistic case: rare conflicts, and a human in the loop.
+
 ### Testing
 - **Unit (`FeesTest`, `LedgerServiceTest`, Mockito):** fee rounding edge cases; exact postings
   built for a capture (including the dropped zero-fee posting and `Long.MAX_VALUE`); lock-then-write

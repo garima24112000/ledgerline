@@ -620,6 +620,54 @@ expiry**; a COMPLETED row holds the response to replay.
 - **Not built yet:** expiring old keys (Stripe keeps them 24 h). It would be a nightly
   `DELETE ... WHERE created_at < now() - interval '24 hours'` job with an index on `created_at`.
 
+### Duplicates and timeouts, end to end
+Request B is a duplicate of A (same key, same body) arriving 1 ms later. The first `alt` branch is
+the normal case; the second is a bank timeout resolved by the reconciler.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant CA as Client, request A
+    participant CB as Client, request B (+1 ms)
+    participant G as gateway-api
+    participant DB as Postgres
+    participant BK as mock-bank
+    participant R as PaymentReconciler
+
+    CA->>G: POST /v1/payments, Idempotency-Key k
+    G->>DB: tx1 INSERT idempotency_keys (k, IN_PROGRESS, locked_until = now + 10 s) ON CONFLICT DO NOTHING
+    DB-->>G: 1 row inserted, commit
+    CB->>G: POST /v1/payments, same key and body
+    G->>DB: tx1 same INSERT
+    Note over DB: k is already in the unique index.<br/>Had A not committed yet, this INSERT would wait for A.
+    DB-->>G: 0 rows
+    G->>DB: SELECT request_hash, status, lock expired?
+    DB-->>G: same hash, IN_PROGRESS, lock still live
+    G-->>CB: 409 IDEMPOTENCY_KEY_IN_USE
+    G->>DB: tx2 INSERT payment PENDING, commit
+    G->>BK: POST /charge with paymentId (2 s read timeout, no transaction open)
+
+    alt bank answers within 2 s
+        BK-->>G: APPROVED
+        G->>DB: tx3 payment CAPTURED + ledger capture + key COMPLETED (201, body)
+        G-->>CA: 201 CAPTURED
+        CB->>G: retry later, same key and body
+        G->>DB: INSERT gives 0 rows, SELECT finds COMPLETED with same hash
+        G-->>CB: 201, identical body, Idempotent-Replayed true
+    else no answer within 2 s
+        Note over BK: bank already stored APPROVED, then keeps sleeping
+        G->>DB: tx3 payment UNKNOWN + release key lock (locked_until = now)
+        G-->>CA: 202 UNKNOWN
+        R->>DB: SELECT unresolved payments older than 5 s (partial index)
+        R->>DB: take key lock, UPDATE only if the lock has expired
+        R->>BK: GET /charges/paymentId
+        BK-->>R: APPROVED (404 would mean never received)
+        R->>DB: tx payment CAPTURED + ledger capture + key COMPLETED (404 gives FAILED)
+        CB->>G: late retry, same key and body
+        G-->>CB: 201 replay of the final state
+    end
+```
+
 ### Timeouts, UNKNOWN, and the reconciler
 A timeout is **not** a decline. The bank may have charged the card and only the response was lost.
 Marking it FAILED would let the customer pay twice (they'd retry with another card), so the payment
@@ -636,6 +684,27 @@ Two things resolve it, and both rely on mock-bank being idempotent on `paymentId
    records the answer. 404 means the bank never received the charge, so no money moved → FAILED
    (`not_received_by_bank`). It also completes the idempotency key, so a late client retry gets the
    final answer as a replay.
+
+**Why a reconciler, not just retrying the charge:**
+- **Nobody may ever retry.** After the 202 the request is over. If the client crashes, gives up, or
+  the customer closes the tab, no retry comes, and the card stays charged with no ledger entry, no
+  merchant credit and no webhook. The server has to resolve its own uncertainty.
+- **Nobody is left to retry after a crash.** If the gateway dies between committing PENDING and
+  hearing from the bank, the in-memory request is gone. Only a scan of durable state finds the
+  payment. That's why PENDING is committed *before* the bank call, and why the reconciler also picks
+  up stale PENDING payments.
+- **An inline retry makes a bank outage worse.** Timeouts come in bursts when the bank is slow.
+  Retrying inside the request doubles its latency and adds load to the struggling bank exactly when
+  it is struggling. The reconciler runs off the request path, in bounded batches, on its own schedule.
+- **Asking is safer than charging again.** The reconciler asks "what happened?" (`GET`, read-only),
+  not "charge it" (`POST`). Re-sending a charge is only harmless while the processor still remembers
+  the idempotency key, and real processors keep keys for a limited window. Minutes or hours later, a
+  re-sent charge could take money the bank never took the first time, from a customer who has
+  already paid another way. A lookup that returns 404 means "no money moved", and FAILED is then the
+  correct, final answer.
+- The client retry still works and is often faster (seconds instead of the next reconciler run), but
+  it's an optimisation. The reconciler is what guarantees every payment is eventually CAPTURED or
+  FAILED.
 
 **The key lock is the mutex.** Before touching a payment, the reconciler takes that payment's
 idempotency-key lock, exactly like a client retry does. So a retry and the reconciler (or two

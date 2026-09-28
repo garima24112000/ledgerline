@@ -13,6 +13,24 @@
     <artifactId>demo-merchant</artifactId>
     <description>Sample merchant that receives and verifies webhooks</description>
 
+    <dependencies>
+        <dependency>
+            <groupId>org.springdoc</groupId>
+            <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.github.ben-manes.caffeine</groupId>
+            <artifactId>caffeine</artifactId>
+        </dependency>
+
+        <!-- TestRestTemplate uses it when present; the JDK client can't read a 401 on a POST. -->
+        <dependency>
+            <groupId>org.apache.httpcomponents.client5</groupId>
+            <artifactId>httpclient5</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
     <build>
         <finalName>demo-merchant</finalName>
         <plugins>

@@ -3,6 +3,8 @@ package com.ledgerline.gateway.payment;
 import com.ledgerline.gateway.idempotency.IdempotencyService;
 import com.ledgerline.gateway.idempotency.IdempotentResponse;
 import com.ledgerline.gateway.ledger.LedgerService;
+import com.ledgerline.gateway.outbox.EventType;
+import com.ledgerline.gateway.outbox.OutboxService;
 import java.util.UUID;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
@@ -19,12 +21,14 @@ public class PaymentTransitions {
     private final PaymentRepository paymentRepository;
     private final LedgerService ledgerService;
     private final IdempotencyService idempotencyService;
+    private final OutboxService outboxService;
 
     public PaymentTransitions(PaymentRepository paymentRepository, LedgerService ledgerService,
-                              IdempotencyService idempotencyService) {
+                              IdempotencyService idempotencyService, OutboxService outboxService) {
         this.paymentRepository = paymentRepository;
         this.ledgerService = ledgerService;
         this.idempotencyService = idempotencyService;
+        this.outboxService = outboxService;
     }
 
     /** Committed before the bank is called, so the reconciler can find the payment if we crash mid-call. */
@@ -35,9 +39,10 @@ public class PaymentTransitions {
     }
 
     /**
-     * Records the bank's definite answer and completes the idempotency key. An approval does three
-     * things in ONE transaction: payment CAPTURED, ledger capture entry, key COMPLETED with the
-     * response. Either all of them happen or none do.
+     * Records the bank's definite answer and completes the idempotency key. An approval does four
+     * things in ONE transaction: payment CAPTURED, ledger capture entry, {@code payment.captured}
+     * outbox event, key COMPLETED with the response. Either all of them happen or none do. A decline
+     * likewise writes FAILED and its {@code payment.failed} event together.
      */
     @Transactional
     public IdempotentResponse<PaymentResponse> recordBankResult(UUID paymentId, BankResult result) {
@@ -48,8 +53,12 @@ public class PaymentTransitions {
             // are taken. It also locks the payment row before the accounts, the same order refunds use.
             paymentRepository.saveAndFlush(payment);
             ledgerService.capture(payment.getId(), payment.getMerchantId(), payment.getAmount());
+            outboxService.append(payment.getMerchantId(), payment.getId(), EventType.PAYMENT_CAPTURED,
+                    PaymentResponse.from(payment));
         } else {
             payment.fail(result.declineReason(), result.bankReference());
+            outboxService.append(payment.getMerchantId(), payment.getId(), EventType.PAYMENT_FAILED,
+                    PaymentResponse.from(payment));
         }
         return completeKey(payment);
     }

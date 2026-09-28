@@ -1,15 +1,16 @@
 # Ledgerline
 
 A mini payment gateway for small merchants: an idempotent payments API on a double-entry ledger,
-with a fake card processor that randomly declines, is slow, or times out. It's a personal learning
+with a fake card processor that randomly declines, is slow, or times out, and signed webhooks
+delivered through a transactional outbox and Kafka. It's a personal learning
 project, and the design decisions and measurements are in [docs/DESIGN.md](docs/DESIGN.md).
 
 | Module | Port | What it does |
 |---|---|---|
-| `gateway-api` | 8080 | Payments REST API, API-key security, idempotency, double-entry ledger, reconciler |
+| `gateway-api` | 8080 | Payments REST API, API-key security, idempotency, double-entry ledger, reconciler, outbox relay |
 | `mock-bank` | 8082 | Fake card processor: approves, declines or times out, idempotent on `paymentId` |
-| `webhook-dispatcher` | 8081 | (in progress) Delivers signed webhooks from Kafka |
-| `demo-merchant` | 8083 | (in progress) Receives and verifies webhooks |
+| `webhook-dispatcher` | 8081 | Delivers signed webhooks from Kafka, with retry topics, a per-merchant bulkhead and a DLT |
+| `demo-merchant` | 8083 | Receives webhooks, verifies the signature, dedupes, can be told to fail |
 
 ## Run it
 
@@ -68,9 +69,47 @@ mock-bank's behaviour is configurable with environment variables: `BANK_APPROVE_
 `BANK_DECLINE_RATE` (0.10), `BANK_TIMEOUT_RATE` (0.05), `BANK_LATENCY_MIN`/`MAX` (50ms/300ms), and
 `BANK_TIMEOUT_SLEEP` (5s).
 
+## Webhooks
+
+Every captured, failed or refunded payment is sent to the merchant's webhook URL (the demo merchants
+all point at demo-merchant, whose log shows each event). The body is the event JSON:
+
+```json
+{"id": "<event id>", "type": "payment.captured", "merchantId": 1, "createdAt": "…", "data": { …same as the API's payment… }}
+```
+
+Types: `payment.captured`, `payment.failed`, `refund.created`. Delivery is **at-least-once**: dedupe
+on `id` (also sent as `X-Ledgerline-Event-Id`).
+
+**Verifying the signature** (`X-Ledgerline-Signature: t=<unix seconds>,v1=<hex>`):
+1. Split the header into `t` and `v1`.
+2. Compute `HMAC-SHA256(webhook secret, t + "." + raw request body)` as lowercase hex.
+3. Compare it with `v1` in constant time, and reject `t` more than 5 minutes from now.
+
+Always use the raw body bytes; parsing and re-serializing the JSON changes them.
+[`SignatureVerifier`](demo-merchant/src/main/java/com/ledgerline/merchant/SignatureVerifier.java) is a
+complete example.
+
+Failed deliveries (non-2xx or no answer within 5 s) are retried after 10 s, 1 m, 6 m and 30 m, then
+parked in the dead-letter topic. To see it happen, simulate a flaky merchant:
+
+```bash
+FAIL_RATE=0.5 java -jar demo-merchant/target/demo-merchant.jar   # half of all webhooks get a 500
+curl -s localhost:8081/actuator/prometheus | grep -E '^(webhook_|dlq_size)'
+curl -u admin:admin-dev-password -X POST localhost:8081/admin/dlq/replay   # send dead letters again
+```
+
+Swagger UI for the replay endpoint: <http://localhost:8081/swagger-ui.html>.
+
 ## Measuring the list query
 
 ```bash
 make seed-payments      # 1M payments for the demo merchants (~15 s)
 make explain-payments   # EXPLAIN ANALYZE with and without the (merchant_id, created_at, id) index
+```
+
+## Measuring the outbox relay query
+
+```bash
+make explain-outbox     # seeds 1M published + 1k unpublished events in a transaction, EXPLAINs, rolls back
 ```

@@ -17,6 +17,18 @@ spring:
       ddl-auto: validate # schema is owned by Flyway, Hibernate only checks it
   flyway:
     locations: classpath:db/migration
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      acks: all # wait for every in-sync replica, so an acked event survives a broker loss
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      properties:
+        enable.idempotence: true # producer retries can't write the same record twice
+        delivery.timeout.ms: 10000 # upper bound on how long the relay holds its row locks
+        request.timeout.ms: 5000
+        max.block.ms: 5000 # don't hang forever when the broker is down
+        linger.ms: 5
 
 gateway:
   bank:
@@ -30,6 +42,13 @@ gateway:
     interval: PT10S # ISO-8601, because @Scheduled reads it as a Duration
     min-age: 5s
     batch-size: 100
+  outbox:
+    relay-enabled: ${OUTBOX_RELAY_ENABLED:true}
+    interval: PT0.2S
+    batch-size: 100
+    topic: payment.events
+    partitions: 6
+    replicas: ${KAFKA_REPLICATION_FACTOR:1}
   auth:
     # Dev defaults only. Set these from secrets in any real deployment.
     admin-username: ${ADMIN_USERNAME:admin}

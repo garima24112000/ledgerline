@@ -8,6 +8,19 @@ spring:
     virtual:
       enabled: true
 
+demo-merchant:
+  fail-rate: ${FAIL_RATE:0.0} # 0.3 -> about 30% of webhooks get a 500, to exercise the dispatcher's retries
+  signature-tolerance: 5m # reject signatures older (or newer) than this: a captured request can't be replayed later
+  # merchant id -> webhook secret, for the three demo merchants seeded by gateway-api's V3 migration
+  secrets:
+    1: whsec_demo_chaipoint
+    2: whsec_demo_booknook
+    3: whsec_demo_pixelprints
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+
 management:
   endpoints:
     web:

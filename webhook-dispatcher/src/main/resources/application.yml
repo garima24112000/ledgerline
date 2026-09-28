@@ -6,7 +6,52 @@ spring:
     name: webhook-dispatcher
   threads:
     virtual:
-      enabled: true
+      enabled: true # also runs the Kafka listener containers on virtual threads
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    consumer:
+      group-id: webhook-dispatcher
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      # Worst case every record times out (5s): 20 x 5s = 100s, well inside max.poll.interval.ms (300s),
+      # so a slow merchant can't get this consumer kicked out of the group.
+      max-poll-records: 20
+    producer: # used to forward failed records to the retry topics / DLT, and by DLQ replay
+      acks: all
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      properties:
+        enable.idempotence: true
+    listener:
+      concurrency: 3 # consumer threads per topic (main, each retry topic, DLT); 6 partitions -> 2 each
+
+dispatcher:
+  topic: payment.events
+  partitions: 6
+  replicas: ${KAFKA_REPLICATION_FACTOR:1}
+  http-timeout: 5s # hard limit on a whole webhook call, connect to last byte
+  bulkhead-max-in-flight: 10 # per merchant, per instance
+  merchant-cache-ttl: 5m
+  dlq-size-refresh: PT15S # ISO-8601, because @Scheduled reads it as a Duration
+  gateway:
+    base-url: ${GATEWAY_URL:http://localhost:8080}
+    service-token: ${INTERNAL_SERVICE_TOKEN:dev-internal-service-token}
+  admin:
+    # Dev defaults only. Set these from secrets in any real deployment.
+    username: ${ADMIN_USERNAME:admin}
+    password: ${ADMIN_PASSWORD:admin-dev-password}
+  # Retry topics: attempt 1 on payment.events, then one retry topic per delay: 10s, 1m, 6m, 30m.
+  # Exponential (x6, capped at 30m); plain milliseconds because @RetryableTopic reads them as numbers.
+  retry:
+    max-attempts: 5
+    initial-delay-ms: 10000
+    multiplier: 6
+    max-delay-ms: 1800000
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
 
 management:
   endpoints:

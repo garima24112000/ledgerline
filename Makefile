@@ -1,7 +1,7 @@
 COMPOSE := docker compose -f infra/docker-compose.yml
 APPS    := gateway-api webhook-dispatcher mock-bank demo-merchant
 
-.PHONY: up down build test run-all seed-payments explain-payments
+.PHONY: up down build test run-all seed-payments explain-payments explain-outbox
 
 up: ## Start Postgres, Redis and Kafka; waits until all are healthy
 	$(COMPOSE) up -d --wait
@@ -29,3 +29,6 @@ seed-payments: ## Insert 1M demo payments into the local Postgres, for EXPLAIN m
 
 explain-payments: ## EXPLAIN ANALYZE the payment list query with and without its index
 	$(COMPOSE) exec -T postgres psql -U ledgerline -d ledgerline -f - < infra/scripts/explain-list-payments.sql
+
+explain-outbox: ## EXPLAIN ANALYZE the outbox relay query with and without its index (seeds and rolls back)
+	$(COMPOSE) exec -T postgres psql -U ledgerline -d ledgerline -f - < infra/scripts/explain-outbox.sql

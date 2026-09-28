@@ -15,7 +15,7 @@ class GatewayApiApplicationIT extends AbstractGatewayIT {
 
     @Test
     void flywayAppliesAllMigrations() {
-        assertThat(flyway.info().current().getVersion().getVersion()).isEqualTo("3");
+        assertThat(flyway.info().current().getVersion().getVersion()).isEqualTo("4");
     }
 
     @Test

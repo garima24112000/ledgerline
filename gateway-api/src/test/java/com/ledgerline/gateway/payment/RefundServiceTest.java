@@ -11,6 +11,8 @@ import static org.mockito.Mockito.when;
 import com.ledgerline.gateway.api.ApiException;
 import com.ledgerline.gateway.idempotency.IdempotencyService;
 import com.ledgerline.gateway.ledger.LedgerService;
+import com.ledgerline.gateway.outbox.EventType;
+import com.ledgerline.gateway.outbox.OutboxService;
 import java.util.Optional;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -32,6 +34,8 @@ class RefundServiceTest {
     private LedgerService ledgerService;
     @Mock
     private IdempotencyService idempotencyService;
+    @Mock
+    private OutboxService outboxService;
 
     @InjectMocks
     private RefundService refundService;
@@ -45,6 +49,7 @@ class RefundServiceTest {
         RefundResponse response = refundService.refund(MERCHANT, payment.getId(), "k", 5_000);
 
         verify(ledgerService).refund(payment.getId(), MERCHANT, 5_000, 3_000);
+        verify(outboxService).append(MERCHANT, response.id(), EventType.REFUND_CREATED, response);
         verify(idempotencyService).complete(MERCHANT, "k", HttpStatus.CREATED, response);
         assertThat(response.amount()).isEqualTo(5_000);
         assertThat(response.paymentRefundedAmount()).isEqualTo(8_000);
@@ -66,7 +71,7 @@ class RefundServiceTest {
 
         assertThatThrownBy(() -> refundService.refund(MERCHANT, payment.getId(), "k", 7_001))
                 .isInstanceOfSatisfying(ApiException.class, e -> assertThat(e.getCode()).isEqualTo("REFUND_EXCEEDS_CAPTURED"));
-        verifyNoInteractions(ledgerService, refundRepository);
+        verifyNoInteractions(ledgerService, refundRepository, outboxService);
     }
 
     @Test

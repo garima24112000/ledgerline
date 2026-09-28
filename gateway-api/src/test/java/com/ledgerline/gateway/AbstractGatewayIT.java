@@ -34,10 +34,11 @@ import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.kafka.KafkaContainer;
 
 /**
- * Shared setup for gateway integration tests: one Postgres container and one WireMock "bank" for
- * the whole run (started once, reused by every subclass), and one Spring context, because every
+ * Shared setup for gateway integration tests: one Postgres container, one Kafka container and one
+ * WireMock "bank" for the whole run (started once, reused by every subclass), and one Spring context, because every
  * subclass has the same configuration.
  *
  * <p>Ledger rows can't be deleted, so tests never clean up. Each test creates its own merchant and
@@ -48,6 +49,7 @@ import org.testcontainers.containers.PostgreSQLContainer;
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {
         "gateway.reconciler.enabled=false", // tests call reconcileOnce() themselves
         "gateway.reconciler.min-age=0s",
+        "gateway.outbox.relay-enabled=false", // tests call relayOnce() themselves
         "gateway.bank.read-timeout=1s"})
 public abstract class AbstractGatewayIT {
 
@@ -56,10 +58,12 @@ public abstract class AbstractGatewayIT {
     protected static final String SERVICE_TOKEN = "dev-internal-service-token";
 
     protected static final PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16-alpine");
+    protected static final KafkaContainer kafka = new KafkaContainer("apache/kafka:3.9.1");
     protected static final WireMockServer bank = new WireMockServer(options().dynamicPort());
 
     static {
         postgres.start();
+        kafka.start();
         bank.start();
     }
 
@@ -68,6 +72,7 @@ public abstract class AbstractGatewayIT {
         registry.add("spring.datasource.url", postgres::getJdbcUrl);
         registry.add("spring.datasource.username", postgres::getUsername);
         registry.add("spring.datasource.password", postgres::getPassword);
+        registry.add("spring.kafka.bootstrap-servers", kafka::getBootstrapServers);
         registry.add("gateway.bank.base-url", bank::baseUrl);
     }
 

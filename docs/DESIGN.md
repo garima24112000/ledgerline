@@ -15,8 +15,10 @@ flowchart LR
     pg -. outbox relay .-> kafka{{Kafka<br/>payment.events}}
     kafka --> wd[webhook-dispatcher :8081]
     wd -->|retry topics| kafka
-    wd -->|exhausted| dlt{{payment.events DLT}}
+    wd -->|exhausted| dlt{{payment.events-dlt}}
+    dlt -. POST /admin/dlq/replay .-> kafka
     wd -->|HMAC-signed webhook| dm[demo-merchant :8083]
+    wd -. webhook URL + secret, cached .-> gw
 ```
 
 | Module | Port | Responsibility |
@@ -28,7 +30,8 @@ flowchart LR
 
 Every app exposes `/actuator/health` (with liveness/readiness probes for Kubernetes) and
 `/actuator/prometheus`, and runs request handling on Java 21 virtual threads
-(`spring.threads.virtual.enabled=true`). gateway-api serves Swagger UI at `/swagger-ui.html`.
+(`spring.threads.virtual.enabled=true`). gateway-api, webhook-dispatcher and demo-merchant serve
+Swagger UI at `/swagger-ui.html`.
 
 ## Decisions
 
@@ -36,15 +39,17 @@ Every app exposes `/actuator/health` (with liveness/readiness probes for Kuberne
 - **Maven multi-module with one parent pom.** The parent inherits `spring-boot-starter-parent` 3.3.13
   so all modules share one dependency set. Dependencies every app needs (web, actuator,
   Prometheus registry, test starter) are declared once in the parent.
-- **Dependencies arrive with the features that use them.** For example, Kafka and Redis clients are
-  not on the classpath yet, so auto-configuration doesn't try to connect to services nothing uses.
+- **Dependencies arrive with the features that use them.** For example, the Redis client is not on
+  the classpath yet, so auto-configuration doesn't try to connect to a service nothing uses. Kafka
+  arrived with the outbox (gateway-api) and the dispatcher.
 
 ### Database
 - **Flyway owns the schema, Hibernate only validates it** (`ddl-auto: validate`). This fits the
   rule that invariants live in Postgres: constraints and triggers are written by hand in SQL
   migrations, never generated. `V1__init.sql` is an empty baseline; `V2__ledger.sql` adds merchants
   and the ledger (see [Ledger](#ledger)); `V3__payments.sql` adds payments, refunds, idempotency keys
-  and the demo merchants (see [Payments](#payments)).
+  and the demo merchants (see [Payments](#payments)); `V4__outbox.sql` adds the transactional outbox
+  (see [Outbox](#outbox)).
 - Flyway 10 needs `flyway-database-postgresql` alongside `flyway-core`.
 - `open-in-view: false`, so no lazy loading can happen in the web layer, and each transaction
   boundary is explicit in the service layer.
@@ -62,8 +67,8 @@ Every app exposes `/actuator/health` (with liveness/readiness probes for Kuberne
   Testcontainers is also raised to 1.21.x (Boot 3.3 ships 1.20.x).
 - **ITs use `@AutoConfigureObservability`.** `@SpringBootTest` disables metrics exporters by default,
   so `/actuator/prometheus` returns 404 in tests unless the annotation re-enables them.
-- **gateway-api ITs share one base class, `AbstractGatewayIT`.** It starts one Postgres container and
-  one WireMock server in a static block (the "singleton container" pattern) and fixes a single set
+- **gateway-api ITs share one base class, `AbstractGatewayIT`.** It starts one Postgres container, one
+  Kafka container and one WireMock server in a static block (the "singleton container" pattern) and fixes a single set
   of test properties. Every IT class therefore reuses **one** cached Spring context. With per-class
   `@Container` fields, each class would start its own database, and a cached context could outlive
   the container it points at.
@@ -887,4 +892,299 @@ settled payments exist. A payment leaves the index automatically when it becomes
     over-refund from raw SQL.
   - `PaymentListIT`: walk every page with duplicate timestamps; status and time filters; other
     merchants' payments never appear; bad cursor / limit / status → 400.
-- `mvn -q clean verify` runs 135 tests across the modules.
+- Test totals for the whole build are at the end of [Webhooks › Testing](#testing-4).
+
+## Outbox
+
+Code: `gateway-api/.../outbox/`, migration `V4__outbox.sql`.
+
+### The problem it solves
+A payment state change must reach merchants. Publishing to Kafka straight from the payment code
+has no safe ordering:
+- **Commit, then publish:** a crash (or a Kafka outage) between the two loses the event. The
+  payment is CAPTURED, and the merchant never hears about it.
+- **Publish, then commit:** the commit can fail after the event is out. The merchant is told about
+  a capture that never happened.
+
+The database and Kafka can't share one transaction. So the event is written to the **database**,
+in the same transaction as the change, and a separate relay moves it to Kafka afterwards.
+
+### Writing events
+| State change | Where | Event |
+|---|---|---|
+| Bank approves | `PaymentTransitions.recordBankResult` | `payment.captured` |
+| Bank declines | `PaymentTransitions.recordBankResult` | `payment.failed` |
+| Refund | `RefundService.refund` | `refund.created` |
+
+- The reconciler resolves UNKNOWN payments through the same `recordBankResult`, so those emit
+  events too. UNKNOWN itself is not a merchant-facing event.
+- `data` is the same JSON the API returns (`PaymentResponse` / `RefundResponse`), so merchants
+  learn one shape.
+- **`OutboxService.append` is `@Transactional(propagation = MANDATORY)`.** It must join the caller's
+  transaction. Called without one, it throws, instead of committing the event on its own. That turns
+  "someone forgot the transaction" from a silent bug into an immediate failure.
+
+### Table
+`outbox_events(id, merchant_id, aggregate_id, event_type, payload JSONB, created_at, published_at, attempts)`
+- `id` is also the **event id** merchants dedupe on (`X-Ledgerline-Event-Id`, and `id` in the body).
+- **`merchant_id` is one column more than the minimum.** It is the Kafka key. Without it, the relay
+  would have to parse every payload to find it.
+- **Invariants in Postgres:** `event_type` is CHECKed and `attempts >= 0`. A trigger makes the event
+  immutable: an UPDATE may only set `published_at` (once, from NULL) and count `attempts`.
+- **Retention:** published rows are never deleted yet. A real deployment needs a cleanup job, for
+  example deleting rows published more than 7 days ago in small batches. The partial index below
+  keeps the relay fast however many rows accumulate.
+
+### The relay
+`OutboxRelay.relayOnce()` runs every 200 ms (`@Scheduled`). Each run is one transaction:
+1. `SELECT … WHERE published_at IS NULL ORDER BY created_at LIMIT 100 FOR UPDATE SKIP LOCKED`
+2. Send every row to `payment.events`, keyed by merchant id, then wait for **every** ack.
+3. `published_at = now()` for the acked rows, `attempts + 1` for the failed ones, then commit.
+
+**Why it is safe with many replicas:** `FOR UPDATE` locks the batch, and `SKIP LOCKED` makes another
+relay pass over locked rows instead of waiting. Two relays therefore get disjoint batches. By the
+time relay A releases its locks (commit), its rows are published, and nobody selects them again.
+`OutboxRelayIT` proves this with two relay instances draining 300 rows at once, in batches of 10.
+
+**Delivery is at-least-once, not exactly-once.** If Kafka acks and the DB commit then fails (crash,
+connection lost), the rows stay unpublished and go out again. That's why every event carries an
+id, and merchants must dedupe. Exactly-once from Postgres to an HTTP endpoint isn't possible;
+at-least-once plus idempotent consumers is the standard answer.
+
+**Trade-off: locks are held while waiting for Kafka.** Elsewhere this codebase never holds a lock
+across a network call (see `PaymentTransitions`). Here it's deliberate, for three reasons:
+- The locks are what make multiple replicas safe.
+- Only relays touch these rows, and they skip locked ones. Payment transactions only INSERT new
+  rows, and never wait on them.
+- The wait is bounded by the producer's `delivery.timeout.ms` (10 s).
+
+The alternative is a lease: an `UPDATE … SET locked_until` claim in one transaction, publish, then
+mark published in another. It holds no lock, but it adds a column, a timeout to tune, and more code.
+
+**Producer settings:**
+- `acks=all`: an ack means every in-sync replica has the record.
+- `enable.idempotence=true`: the producer's own retries can't write a record twice or reorder a
+  partition.
+- `max.block.ms=5000`: with Kafka down, a relay run fails fast (rows get `attempts + 1`) instead of
+  hanging.
+
+**Throughput:** one batch per tick gives at most about 500 events/s per replica. That's plenty
+here, and draining in a loop while batches come back full is a two-line change.
+
+**Ordering:** events are keyed by merchant id, so one merchant's events land on one partition in
+`created_at` order. Webhook delivery doesn't preserve that order anyway, because retry topics let a
+later event overtake a failing one. So merchants should treat each event as a standalone fact, and
+`data.status` / `updatedAt` tell them the latest state.
+
+### EXPLAIN ANALYZE: the relay query
+The relay runs 5 times a second per replica. Almost every row in the table is published, and
+only a small backlog is not. `make explain-outbox` seeds 1M published and 1,000 unpublished rows
+(in a transaction it rolls back) and compares:
+
+```
+-- WITH outbox_events_unpublished_idx (partial: WHERE published_at IS NULL)
+Limit (actual time=0.024..0.081 rows=100 loops=1)
+  Buffers: shared hit=105
+  ->  LockRows (actual time=0.024..0.076 rows=100 loops=1)
+        ->  Index Scan using outbox_events_unpublished_idx on outbox_events (actual time=0.016..0.042 rows=100 loops=1)
+              Buffers: shared hit=5
+Execution Time: 0.097 ms
+
+-- WITHOUT it
+Limit (actual time=50.270..50.290 rows=100 loops=1)
+  Buffers: shared hit=15399 read=1960 written=32
+  ->  LockRows
+        ->  Sort (Sort Key: created_at)
+              ->  Seq Scan on outbox_events (actual time=49.926..50.131 rows=1000 loops=1)
+                    Filter: (published_at IS NULL)
+                    Rows Removed by Filter: 1000004
+Execution Time: 50.306 ms
+```
+The index scan is about 500× faster and reads 105 buffers instead of about 17,000. The index
+holds only unpublished rows, so it stays a few pages however large the table grows. A row leaves
+it when `published_at` is set. The dispatcher's merchant lookup
+(`GET /internal/merchants/{id}/webhook-config`) is a primary-key lookup, and it is cached.
+
+### Testing
+- **Unit (Mockito):**
+  - `OutboxRelayTest`: the envelope shape and key; partial failure (one nacked, one throwing
+    synchronously), where only acked rows are marked and the others get `attempts + 1`; an empty batch
+    sends nothing.
+  - `PaymentTransitionsTest`: capture appends `payment.captured` after the ledger entry and before
+    completing the key; decline appends `payment.failed` without touching the ledger; UNKNOWN appends
+    nothing.
+  - `RefundServiceTest`: `refund.created`.
+- **Integration (`OutboxTransactionIT`):**
+  - Capture, decline and refund each write exactly their event, alongside the ledger entry.
+  - **Forced failure mid-transaction:** a `@SpyBean` makes `IdempotencyService.complete` throw.
+    That is the last step, after the ledger and outbox writes. The payment stays PENDING, and there
+    is no journal entry, no balance change, and no outbox row.
+  - `append` outside a transaction is refused.
+- **Integration (`OutboxRelayIT`, Testcontainers Kafka):**
+  - A captured payment is published keyed by merchant id, and `published_at` is set.
+  - **Two relay instances drain 300 rows concurrently:** their id sets are disjoint, together they
+    cover all 300, and the topic holds each id exactly once.
+  - A relay whose broker is unreachable leaves the row unpublished with `attempts = 1`, and a
+    working relay publishes it next.
+
+## Webhooks
+
+Code: `webhook-dispatcher/`.
+
+### Flow
+```
+payment.events ──► PaymentEventListener ──► WebhookDeliveryService.deliver
+                        │ throws                 1. parse event (id, merchantId)
+                        ▼                        2. merchant URL + secret (Caffeine cache → gateway-api)
+   payment.events-retry-10000 ─► …-retry-60000   3. bulkhead tryAcquire, or throw BulkheadFullException
+   ─► …-retry-360000 ─► …-retry-1800000          4. sign, POST (5 s hard timeout), non-2xx → throw
+   ─► payment.events-dlt ─► POST /admin/dlq/replay puts it back on payment.events
+```
+
+### Signing
+```
+X-Ledgerline-Event-Id:  <event id>
+X-Ledgerline-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256(secret, "<t>.<raw body>")>
+```
+- **The body is the Kafka value, byte for byte.** The dispatcher never re-serializes it, so the
+  signature covers exactly what the merchant receives.
+- **The timestamp is inside the signed message**, so a captured request can't be replayed later
+  with a fresh `t`. The merchant rejects `t` outside a tolerance (demo-merchant: 5 minutes).
+- The format follows Stripe's well-known scheme, so merchants recognise it.
+
+### Retries: retry topics, not in-place retries
+A failed record is **not** retried in the listener, because that would block its partition, and
+every merchant on it, for the whole backoff. Spring Kafka's `@RetryableTopic` forwards it to a retry
+topic per delay instead. That topic's consumer pauses the partition until the record is due. The
+main topic keeps flowing.
+
+- **Schedule:** 10 s, 1 m, 6 m, 30 m, then the DLT. That's 5 attempts in total.
+  - It is exponential: initial 10 s, ×6, capped at 30 m.
+  - The brief's "5 m" became 6 m, because a single multiplier can't produce 10 s → 1 m → 5 m → 30 m.
+  - Everything is configurable (`dispatcher.retry.*`). ITs use 200 ms ×2 with 3 attempts.
+- **What is retried:** a non-2xx response, a timeout, a connection error, a full bulkhead, and
+  gateway-api being unreachable during the config lookup.
+- **Not retried, straight to the DLT:** an unknown merchant (gateway-api 404) and a malformed event.
+  Retrying can't fix those, so they are listed in `exclude`.
+- **Consumer tuning:** with `max.poll.records=20` and 5 s per record in the worst case, one poll's
+  work is at most 100 s, well inside `max.poll.interval.ms` (300 s). The default of 500 records could
+  take 2,500 s, and the broker would evict the consumer mid-batch.
+
+### Concurrency and the bulkhead
+- `payment.events` has 6 partitions, and listener concurrency is 3, so each consumer gets 2
+  partitions. Every retry topic and the DLT get their own 3 consumers.
+- **The HTTP call:** a JDK `HttpClient` with a virtual-thread executor.
+  `sendAsync(...).orTimeout(5 s)` is a **hard** limit on the whole exchange, including connect,
+  headers and a merchant trickling the body. `HttpRequest.timeout` alone only covers waiting for
+  the response headers. On timeout, the request is cancelled.
+- **Bulkhead:** `MerchantBulkhead` is a `ConcurrentHashMap<merchantId, Semaphore(10)>` with a
+  non-blocking `tryAcquire`. If one merchant already has 10 calls in flight, the event goes to the
+  next retry topic instead of occupying another thread.
+
+**What the bulkhead actually buys (honestly):**
+- Deliveries are synchronous per consumer thread. One instance has 15 delivery threads: 3 on the
+  main topic and 3 on each of the 4 retry topics.
+- A merchant whose endpoint hangs can hold at most 10 of those 15, so the other merchants keep at
+  least 5.
+- The main protection against one slow merchant is the **5 s timeout + retry topics**. After one
+  timeout, its events leave the main partitions.
+- One cost is deliberate: a rejection on a retry topic moves the event on to the next retry topic,
+  which uses an attempt. The alternative, re-queueing to the first retry topic without counting an
+  attempt, needs hand-written backoff headers. It isn't worth the complexity here.
+
+**Why not async listeners?** Returning a `CompletableFuture` from the listener would let one
+consumer have many calls in flight, which would make the bulkhead the main limit. It also
+complicates offset commits and retry routing. Synchronous handling on 15 threads is simpler to
+reason about, and is enough for a demo.
+
+### Merchant config cache
+- `MerchantConfigClient` calls gateway-api's `GET /internal/merchants/{id}/webhook-config`
+  (`X-Service-Token`) through a Caffeine `LoadingCache` with `expireAfterWrite(5 m)`. That's one
+  lookup per merchant per 5 minutes, not one per event.
+- The TTL is the trade-off: a changed webhook URL or rotated secret takes up to 5 minutes to be
+  picked up.
+
+### Dead letters and replay
+- The DLT **is** the dead-letter queue. The dispatcher has no database.
+- **Replay progress** is the committed offset of a dedicated consumer group,
+  `webhook-dispatcher-dlq-replay`. Everything after it has not been replayed yet.
+- `POST /admin/dlq/replay` (HTTP Basic, the same admin credentials as gateway-api) does 4 things:
+  1. Snapshots the DLT's end offsets.
+  2. Re-publishes every letter before them to `payment.events`, with its original key and body but
+     **without** the retry headers, so it gets a fresh set of attempts. It waits for each ack.
+  3. Commits the snapshot.
+  4. Returns `{"replayed": n}`.
+- Letters that arrive during a replay wait for the next one. The event id is unchanged, so a
+  merchant that got the event after all dedupes it.
+- The method is `synchronized`, so two concurrent replays in one instance can't double-publish.
+  Across instances, the consumer group would split the partitions between them.
+
+### Metrics
+| Metric | Meaning |
+|---|---|
+| `webhook_delivery_total{result}` | `success`, `http_error` (non-2xx), `timeout`, `connection_error`, `bulkhead_rejected` |
+| `webhook_retry_total` | deliveries attempted from a retry topic |
+| `dlq_size` | dead letters not replayed yet |
+
+`dlq_size` is the sum of (DLT end offset − replay group's committed offset). It is recomputed every
+15 s by a `@Scheduled` job and stored in an `AtomicLong`. A Prometheus scrape therefore never calls
+Kafka, and a slow or down broker can't stall `/actuator/prometheus`.
+
+### Observed on a fresh broker
+The very first dispatcher start against a brand-new local Kafka took about 2.5 minutes. Five
+listener containers each logged "Consumer thread failed to start" after Spring Kafka's 30 s wait.
+Later starts took 1.8 s, and I couldn't reproduce it. The likely cause is the first-ever consumer
+group creating `__consumer_offsets` while the virtual-thread consumers wait. If it shows up again,
+the next step is running the listener containers on platform threads, which a `ContainerCustomizer`
+can set. They are 15 long-lived pollers, so virtual threads buy nothing there.
+
+### Testing
+- **Unit (Mockito):**
+  - `WebhookSignerTest`: matches a vector computed independently with `openssl dgst -sha256 -hmac`;
+    changing the body, the secret or the timestamp changes the signature.
+  - `WebhookDeliveryServiceTest`:
+    - **Bulkhead:** ten deliveries for merchant A are held inside a mocked HTTP call (an
+      `ExecutorService` plus a `CountDownLatch`). The 11th for A gets `BulkheadFullException` with
+      no HTTP call, while merchant B is delivered. After release, all ten succeed and the permits are
+      back.
+    - The headers and the unchanged body; 500 → failure; timeout → failure and the permit is freed;
+      a malformed event fails before any lookup.
+- **Integration (`WebhookDeliveryIT`, Testcontainers Kafka + WireMock as gateway-api and merchant):**
+  - Always 500 → exactly 3 POSTs, all with the same event id and a valid signature (re-verified in
+    the test with its own HMAC code); the event lands in the DLT; `webhook_retry_total` +2;
+    `dlq_size` ≥ 1; metrics on `/actuator/prometheus`.
+  - 500 then 200 → exactly 2 POSTs, and nothing in the DLT.
+  - Unknown merchant → DLT with no retries.
+  - Replay: 401 without credentials; with them the event is re-delivered and `dlq_size` goes back to 0.
+- `WebhookDispatcherApplicationIT`: health, Prometheus (including `dlq_size`), and OpenAPI for the
+  replay endpoint.
+- **Test HTTP client:** the dispatcher and demo-merchant have `httpclient5` as a test dependency.
+  `TestRestTemplate` otherwise uses `HttpURLConnection`, which throws instead of returning a 401 to
+  a POST.
+- **Whole build:** `mvn -q clean verify` runs 174 tests across the modules.
+
+## Demo merchant
+
+Code: `demo-merchant/`. `POST /webhooks` checks, in order:
+1. **The body is taken as a raw `String`**, because the signature covers the exact bytes. The
+   merchant id in the (still unverified) body only picks which secret to verify with. Without that
+   merchant's secret, nobody can produce a signature that passes, so that's safe. All three demo
+   merchants share one URL, which is why the id is needed.
+2. **Signature check:** `MessageDigest.isEqual`, which is constant time, and `t` within ±5 minutes.
+   A failure returns 401.
+3. **`FAIL_RATE`** (0.0–1.0): that share of valid webhooks get a 500 **before** the event is
+   recorded. The retry is then processed for real.
+4. **Dedupe:** event ids go in a Caffeine set (24 h). A repeat returns 200 `duplicate` and is not
+   processed again. A real merchant would use a unique constraint in its own database.
+5. Log the event and return 200.
+
+`SignatureVerifier` is deliberately **not** shared with the dispatcher. It is "the merchant's code",
+written against the documented format, so a bug in the dispatcher's signer can't be hidden by the
+same bug on the other side.
+
+Tests: `SignatureVerifierTest` (the same openssl vector, a wrong secret, a tampered body, a moved
+timestamp, the tolerance window, malformed headers). `WebhookControllerIT`:
+- a valid webhook is processed, and a duplicate is not processed again (checked in the log);
+- a wrong secret, another merchant's secret, a stale signature or no signature → 401;
+- an event-id header that doesn't match the body → 400;
+- `fail-rate=1` → 500, and the event is not recorded.

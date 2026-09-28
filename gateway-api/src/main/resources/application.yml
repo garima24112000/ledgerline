@@ -18,6 +18,24 @@ spring:
   flyway:
     locations: classpath:db/migration
 
+gateway:
+  bank:
+    base-url: ${BANK_URL:http://localhost:8082}
+    connect-timeout: 1s
+    read-timeout: 2s # no answer by then -> the payment is UNKNOWN
+  idempotency:
+    lock-ttl: 10s # must exceed the slowest request (bounded by the bank read timeout)
+  reconciler:
+    enabled: ${RECONCILER_ENABLED:true}
+    interval: PT10S # ISO-8601, because @Scheduled reads it as a Duration
+    min-age: 5s
+    batch-size: 100
+  auth:
+    # Dev defaults only. Set these from secrets in any real deployment.
+    admin-username: ${ADMIN_USERNAME:admin}
+    admin-password: ${ADMIN_PASSWORD:admin-dev-password}
+    service-token: ${INTERNAL_SERVICE_TOKEN:dev-internal-service-token}
+
 springdoc:
   swagger-ui:
     path: /swagger-ui.html

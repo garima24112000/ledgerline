@@ -25,4 +25,21 @@ public final class Fees {
         long remainder = amount % BASIS_POINTS_PER_WHOLE;
         return wholes * CAPTURE_FEE_BASIS_POINTS + remainder * CAPTURE_FEE_BASIS_POINTS / BASIS_POINTS_PER_WHOLE;
     }
+
+    /**
+     * Part of the capture fee to give back when refunding {@code amount} on top of
+     * {@code refundedBefore} already refunded: {@code fee(before + amount) - fee(before)}.
+     *
+     * <p>Rounding each refund's fee on its own would drift: two refunds of 49 each return 0 + 0,
+     * although the fee on 98 was 1. Taking the difference of cumulative fees makes the refunds
+     * telescope: however a payment is split into refunds, the fee returned in total is exactly the
+     * capture fee. Each step is >= 0 because the fee never decreases as the amount grows.
+     */
+    public static long refundFee(long refundedBefore, long amount) {
+        if (refundedBefore < 0) {
+            throw new IllegalArgumentException("refundedBefore must not be negative, was " + refundedBefore);
+        }
+        long feeBefore = refundedBefore == 0 ? 0 : captureFee(refundedBefore);
+        return captureFee(Math.addExact(refundedBefore, amount)) - feeBefore;
+    }
 }

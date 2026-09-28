@@ -5,9 +5,7 @@ import static com.ledgerline.gateway.ledger.PostingRequest.debit;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-import com.ledgerline.gateway.merchant.Merchant;
-import com.ledgerline.gateway.merchant.MerchantRepository;
-import com.ledgerline.gateway.merchant.RateLimitTier;
+import com.ledgerline.gateway.AbstractGatewayIT;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.Statement;
@@ -22,27 +20,14 @@ import javax.sql.DataSource;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.boot.test.web.client.TestRestTemplate;
-import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.dao.DataIntegrityViolationException;
-import org.springframework.jdbc.core.simple.JdbcClient;
-import org.testcontainers.containers.PostgreSQLContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.junit.jupiter.Testcontainers;
 
 /**
  * Runs against real Postgres so the triggers, constraints and row locks are the ones in production.
  * Tests never delete ledger rows (the triggers forbid it); each test creates its own merchant and
  * asserts on changes, so tests stay independent while sharing one database.
  */
-@Testcontainers
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
-class LedgerIT {
-
-    @Container
-    @ServiceConnection
-    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16-alpine");
+class LedgerIT extends AbstractGatewayIT {
 
     @Autowired
     private LedgerService ledgerService;
@@ -51,16 +36,7 @@ class LedgerIT {
     private AccountRepository accountRepository;
 
     @Autowired
-    private MerchantRepository merchantRepository;
-
-    @Autowired
-    private JdbcClient jdbc;
-
-    @Autowired
     private DataSource dataSource;
-
-    @Autowired
-    private TestRestTemplate rest;
 
     private long merchantId;
     private long merchantPayable;
@@ -68,12 +44,10 @@ class LedgerIT {
     private long platformFees;
 
     @BeforeEach
-    void createMerchant() {
-        String unique = UUID.randomUUID().toString();
-        Merchant merchant = merchantRepository.save(
-                new Merchant("Chai Point " + unique, "hash-" + unique, "http://merchant.test/hooks", "secret", RateLimitTier.STANDARD));
-        merchantId = merchant.getId();
-        merchantPayable = accountRepository.save(Account.merchantPayable(merchantId, "INR")).getId();
+    void setUpMerchant() {
+        TestMerchant merchant = createMerchant();
+        merchantId = merchant.id();
+        merchantPayable = merchant.payableAccountId();
         customerFunds = platformAccount(AccountType.CUSTOMER_FUNDS).getId();
         platformFees = platformAccount(AccountType.PLATFORM_FEES).getId();
     }
@@ -82,7 +56,7 @@ class LedgerIT {
     void balancedCaptureIsRecordedWithPostingsAndBalances() {
         long customerFundsBefore = balance(customerFunds);
         long feesBefore = balance(platformFees);
-        UUID paymentId = UUID.randomUUID();
+        UUID paymentId = insertPayment(merchantId);
 
         long entryId = ledgerService.capture(paymentId, merchantId, 10_000);
 
@@ -113,7 +87,7 @@ class LedgerIT {
             connection.setAutoCommit(false);
 
             // Both inserts succeed: the balance check is deferred until commit.
-            sql.execute("INSERT INTO journal_entries (payment_id, type) VALUES (gen_random_uuid(), 'CAPTURE')");
+            sql.execute("INSERT INTO journal_entries (payment_id, type) VALUES ('" + insertPayment(merchantId) + "', 'CAPTURE')");
             sql.execute("INSERT INTO postings (journal_entry_id, account_id, direction, amount) "
                     + "VALUES (currval('journal_entries_id_seq'), " + customerFunds + ", 'DEBIT', 100), "
                     + "       (currval('journal_entries_id_seq'), " + merchantPayable + ", 'CREDIT', 99)");
@@ -130,7 +104,7 @@ class LedgerIT {
     void journalEntryWithoutPostingsIsRejectedAtCommit() throws SQLException {
         try (Connection connection = dataSource.getConnection(); Statement sql = connection.createStatement()) {
             connection.setAutoCommit(false);
-            sql.execute("INSERT INTO journal_entries (payment_id, type) VALUES (gen_random_uuid(), 'CAPTURE')");
+            sql.execute("INSERT INTO journal_entries (payment_id, type) VALUES ('" + insertPayment(merchantId) + "', 'CAPTURE')");
 
             assertThatThrownBy(connection::commit).hasMessageContaining("has no postings");
         }
@@ -138,7 +112,7 @@ class LedgerIT {
 
     @Test
     void postingsCannotBeUpdatedOrDeleted() {
-        long entryId = ledgerService.capture(UUID.randomUUID(), merchantId, 10_000);
+        long entryId = ledgerService.capture(insertPayment(merchantId), merchantId, 10_000);
 
         assertThatThrownBy(() -> jdbc.sql("UPDATE postings SET amount = amount + 1 WHERE journal_entry_id = ?")
                 .param(entryId).update())
@@ -156,7 +130,7 @@ class LedgerIT {
 
     @Test
     void journalEntriesCannotBeUpdatedOrDeleted() {
-        long entryId = ledgerService.capture(UUID.randomUUID(), merchantId, 10_000);
+        long entryId = ledgerService.capture(insertPayment(merchantId), merchantId, 10_000);
 
         assertThatThrownBy(() -> jdbc.sql("UPDATE journal_entries SET description = 'edited' WHERE id = ?")
                 .param(entryId).update())
@@ -167,7 +141,7 @@ class LedgerIT {
 
     @Test
     void paymentCannotBeCapturedTwice() {
-        UUID paymentId = UUID.randomUUID();
+        UUID paymentId = insertPayment(merchantId);
         ledgerService.capture(paymentId, merchantId, 10_000);
 
         assertThatThrownBy(() -> ledgerService.capture(paymentId, merchantId, 10_000))
@@ -179,7 +153,7 @@ class LedgerIT {
     @Test
     void merchantPayableCannotGoNegative() {
         // A refund of money the merchant doesn't have: debit MERCHANT_PAYABLE, credit CUSTOMER_FUNDS.
-        JournalEntryRequest overdraw = new JournalEntryRequest(UUID.randomUUID(), EntryType.REFUND, null, List.of(
+        JournalEntryRequest overdraw = new JournalEntryRequest(insertPayment(merchantId), EntryType.REFUND, null, List.of(
                 debit(merchantPayable, 1), credit(customerFunds, 1)));
 
         assertThatThrownBy(() -> ledgerService.post(overdraw))
@@ -199,9 +173,10 @@ class LedgerIT {
         List<Future<Long>> results = new ArrayList<>();
         try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
             for (int i = 0; i < captures; i++) {
+                UUID paymentId = insertPayment(merchantId);
                 results.add(executor.submit(() -> {
                     start.await(); // release all threads at once to maximise contention
-                    return ledgerService.capture(UUID.randomUUID(), merchantId, amount);
+                    return ledgerService.capture(paymentId, merchantId, amount);
                 }));
             }
             start.countDown();
@@ -219,20 +194,20 @@ class LedgerIT {
 
     @Test
     void verifyEndpointReportsConsistentLedger() {
-        ledgerService.capture(UUID.randomUUID(), merchantId, 5_000);
+        ledgerService.capture(insertPayment(merchantId), merchantId, 5_000);
 
-        LedgerVerification report = rest.getForObject("/admin/ledger/verify", LedgerVerification.class);
+        LedgerVerification report = rest.withBasicAuth(ADMIN_USER, ADMIN_PASSWORD).getForObject("/admin/ledger/verify", LedgerVerification.class);
 
         assertThat(report).isEqualTo(new LedgerVerification(true, true, List.of(), true, List.of(), 0));
     }
 
     @Test
     void verifyEndpointDetectsCachedBalanceDrift() {
-        ledgerService.capture(UUID.randomUUID(), merchantId, 5_000);
+        ledgerService.capture(insertPayment(merchantId), merchantId, 5_000);
         // accounts is not append-only, so a buggy writer could corrupt the cache. Simulate that.
         jdbc.sql("UPDATE accounts SET balance = balance + 1 WHERE id = ?").param(merchantPayable).update();
         try {
-            LedgerVerification report = rest.getForObject("/admin/ledger/verify", LedgerVerification.class);
+            LedgerVerification report = rest.withBasicAuth(ADMIN_USER, ADMIN_PASSWORD).getForObject("/admin/ledger/verify", LedgerVerification.class);
 
             assertThat(report.consistent()).isFalse();
             assertThat(report.allEntriesBalanced()).isTrue();
@@ -245,10 +220,6 @@ class LedgerIT {
 
     private Account platformAccount(AccountType type) {
         return accountRepository.findByOwnerTypeAndOwnerIdIsNullAndType(OwnerType.PLATFORM, type).orElseThrow();
-    }
-
-    private long balance(long accountId) {
-        return jdbc.sql("SELECT balance FROM accounts WHERE id = ?").param(accountId).query(Long.class).single();
     }
 
     private long count(String table) {

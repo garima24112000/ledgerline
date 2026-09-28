@@ -43,7 +43,8 @@ Every app exposes `/actuator/health` (with liveness/readiness probes for Kuberne
 - **Flyway owns the schema, Hibernate only validates it** (`ddl-auto: validate`). This fits the
   rule that invariants live in Postgres: constraints and triggers are written by hand in SQL
   migrations, never generated. `V1__init.sql` is an empty baseline; `V2__ledger.sql` adds merchants
-  and the ledger (see [Ledger](#ledger)).
+  and the ledger (see [Ledger](#ledger)); `V3__payments.sql` adds payments, refunds, idempotency keys
+  and the demo merchants (see [Payments](#payments)).
 - Flyway 10 needs `flyway-database-postgresql` alongside `flyway-core`.
 - `open-in-view: false`, so no lazy loading can happen in the web layer, and each transaction
   boundary is explicit in the service layer.
@@ -61,6 +62,14 @@ Every app exposes `/actuator/health` (with liveness/readiness probes for Kuberne
   Testcontainers is also raised to 1.21.x (Boot 3.3 ships 1.20.x).
 - **ITs use `@AutoConfigureObservability`.** `@SpringBootTest` disables metrics exporters by default,
   so `/actuator/prometheus` returns 404 in tests unless the annotation re-enables them.
+- **gateway-api ITs share one base class, `AbstractGatewayIT`.** It starts one Postgres container and
+  one WireMock server in a static block (the "singleton container" pattern) and fixes a single set
+  of test properties. Every IT class therefore reuses **one** cached Spring context. With per-class
+  `@Container` fields, each class would start its own database, and a cached context could outlive
+  the container it points at.
+- **The bank is WireMock in gateway ITs, not the real mock-bank.** Tests need exact outcomes, real
+  delays (to trigger the 1 s read timeout), and to count how many charges reached the bank
+  ("exactly one charge for 20 concurrent requests"). mock-bank has its own tests in its module.
 
 ### Local infrastructure (`infra/docker-compose.yml`)
 - **Kafka runs single-node KRaft** (`apache/kafka`): one process is both broker and controller, with no ZooKeeper.
@@ -78,10 +87,7 @@ Every app exposes `/actuator/health` (with liveness/readiness probes for Kuberne
   once Postgres, Redis and Kafka are ready.
 
 ### Security
-- Spring Security is on the classpath but **temporarily permits all requests** (CSRF disabled, since
-  this is a stateless JSON API). Merchant API-key auth replaces this once payments exist.
-  `/admin/**` (currently only `/admin/ledger/verify`) is also open for now. It must get its own
-  operator role before anything is deployed.
+See [Security](#security-1) under Payments.
 
 ## Ledger
 
@@ -100,7 +106,7 @@ Code: `gateway-api/.../ledger/`, schema: `V2__ledger.sql`.
   | `CUSTOMER_FUNDS` | platform | yes | Clearing account money arrives through. It is debited on capture, so it goes negative by design. |
   | `MERCHANT_PAYABLE` | one per merchant | no | What we owe the merchant. It can never go below 0, so a refund larger than the merchant's balance fails in the DB. |
   | `PLATFORM_FEES` | platform | no | Our revenue. |
-  | `REFUNDS` | platform | yes | Seeded for the refund flow; unused so far. |
+  | `REFUNDS` | platform | yes | Seeded, still unused: refunds mirror the capture instead (see [Refunds](#refunds-reversing-entries-that-telescope)). |
 
 - **Capture of A with fee F:** debit `CUSTOMER_FUNDS` A, credit `MERCHANT_PAYABLE` A−F,
   credit `PLATFORM_FEES` F. When F rounds down to 0 (A < 50 paise), the fee posting is left out,
@@ -448,3 +454,368 @@ optimistic case: rare conflicts, and a human in the loop.
   50 concurrent captures; `/verify` clean, and detects deliberately corrupted balances.
 - Ledger rows can't be deleted, so ITs don't clean up. Each test creates its own merchant and
   asserts on *changes* to the shared platform accounts.
+
+## Mock bank
+
+Code: `mock-bank/.../bank/`.
+
+- `POST /charge {paymentId, amount, cardToken}` → `APPROVED` or `DECLINED`. `GET /charges/{paymentId}`
+  → the stored result, or 404 if the bank never received that charge.
+- **Outcomes by rate** (`bank.*`, overridable with `BANK_*` env vars): 85% approve, 10% decline, 5%
+  timeout, and 50–300 ms of latency. The three rates must sum to 1, which is checked when
+  `BankProperties` is constructed, so a typo fails at startup instead of skewing results quietly.
+- **A timeout still has an outcome.** The bank decides (with the approve:decline odds), **stores the
+  decision, then** sleeps 5 s, past the gateway's 2 s read timeout. The card has been charged but the
+  caller never hears about it. That is the realistic worst case, and the reason the gateway has
+  `UNKNOWN` and a reconciler.
+- **Idempotent on `paymentId`:** `ConcurrentHashMap.putIfAbsent`. Two concurrent first requests
+  for the same id share one decision, and a retry returns the stored decision immediately, without
+  sleeping again. Reusing an id with a different amount or card is a 409.
+- **Magic card tokens** `tok_approve`, `tok_decline`, `tok_timeout` override the dice, for demos.
+- **Randomness and sleeping are injected** (`RandomGenerator`, `Sleeper`), so unit tests are
+  deterministic and never wait.
+- **Trade-off:** charges live in memory and a restart forgets them. After a restart, the reconciler's
+  lookup of an old UNKNOWN payment gets 404 and marks it FAILED, even though the "bank" had approved
+  it. That is fine for a mock. A real processor keeps this record durably, and that durability is
+  what the whole reconciliation design relies on.
+
+## Payments
+
+Code: `gateway-api/.../payment/`, `.../idempotency/`, `.../security/`; schema: `V3__payments.sql`.
+
+### Security
+One stateless `SecurityFilterChain` (no sessions, CSRF off: no cookies means nothing for CSRF to
+ride on), with three ways in:
+
+| Credential | Filter / mechanism | Role | Paths |
+|---|---|---|---|
+| `X-Api-Key` | `ApiKeyAuthenticationFilter` → `ApiKeyAuthenticationProvider` | `MERCHANT` | `/v1/**` |
+| `X-Service-Token` | `ServiceTokenAuthenticationFilter` → `ServiceTokenAuthenticationProvider` | `SERVICE` | `/internal/**` |
+| HTTP Basic | Spring's `BasicAuthenticationFilter` → `DaoAuthenticationProvider` | `ADMIN` | `/admin/**` |
+
+Public: `/actuator/health/**`, `/actuator/prometheus`, `/v3/api-docs/**`, `/swagger-ui/**`. Everything
+else is `denyAll()`.
+
+- **API keys are stored as SHA-256 hex, looked up by hash** through the existing unique index on
+  `merchants.api_key_hash` (0.04 ms, see below). A fast unsalted hash is correct here, unlike for
+  passwords. Keys are long random strings with no dictionary to attack, and the hash must be
+  deterministic to be indexable. bcrypt would need a scan and ~100 ms of CPU per request.
+- **The service token is compared with `MessageDigest.isEqual`** (constant time). `String.equals`
+  returns at the first wrong byte, which leaks through timing how much of a guess was right.
+- **Why one chain, not one per path:** a merchant key sent to `/admin/**` should get **403** ("we know
+  who you are; you can't do this"). With a separate admin chain that only knows Basic, the merchant
+  key would be ignored and the answer would be 401.
+- **A bad credential is rejected in the filter (401 immediately); a missing one continues as
+  anonymous**, and the authorization rules decide. So public endpoints work without headers, and a
+  typo'd key never falls through to anonymous access.
+- **The `AuthenticationManager` is built by hand** from all three providers. Gotcha: if a custom
+  `AuthenticationProvider` is exposed as a bean, Spring Boot stops wiring the `UserDetailsService`
+  into its default manager, and HTTP Basic silently stops working.
+- **401/403 bodies use the same `{error: {code, message}}` format.** Security errors happen in the
+  filter chain before any controller, so `@RestControllerAdvice` never sees them. The entry point and
+  access-denied handler in `JsonSecurityErrorHandler` write the JSON themselves.
+- **Another merchant's payment is a 404, not a 403.** Every lookup is `WHERE id = ? AND merchant_id = ?`
+  (`findByIdAndMerchantId`). A 403 would confirm that the id exists. With a 404, other merchants'
+  payments are simply invisible.
+- **`/actuator/prometheus` is public** so Prometheus can scrape without credentials, which is the usual
+  in-cluster setup. The ingress must not route it publicly.
+- Demo credentials are dev defaults in `application.yml`, overridable by env vars. The three demo
+  merchants' raw keys are only in README.md, and the migration holds only their hashes.
+
+### State machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: payment row committed
+    PENDING --> CAPTURED: bank APPROVED
+    PENDING --> FAILED: bank DECLINED
+    PENDING --> UNKNOWN: no answer in 2 s
+    UNKNOWN --> CAPTURED: retry or reconciler finds APPROVED
+    UNKNOWN --> FAILED: DECLINED, or the bank never received it
+    CAPTURED --> CAPTURED: refunds (refunded_amount grows)
+```
+
+Enforced three times, from friendliest to strictest: `Payment.capture/fail/markUnknown` throw on an
+illegal move; `@Version` makes two concurrent transitions conflict instead of overwriting each other;
+and the `payments_status_transition` trigger rejects illegal moves from any writer. `CHECK`s cap
+`refunded_amount` at `amount` and allow it only on CAPTURED payments.
+
+### Creating a payment
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant G as gateway-api
+    participant DB as Postgres
+    participant B as mock-bank
+    C->>G: POST /v1/payments (Idempotency-Key)
+    G->>DB: tx1: INSERT idempotency_keys IN_PROGRESS (ON CONFLICT DO NOTHING)
+    G->>DB: tx2: INSERT payment PENDING
+    G->>B: POST /charge (2 s read timeout, no transaction open)
+    alt APPROVED
+        G->>DB: tx3: payment CAPTURED + ledger capture + key COMPLETED(201, body)
+    else DECLINED
+        G->>DB: tx3: payment FAILED + key COMPLETED(201, body)
+    else timeout / error
+        G->>DB: tx3: payment UNKNOWN + key lock released
+    end
+    G-->>C: 201 CAPTURED / 201 FAILED / 202 UNKNOWN
+```
+
+- **`PaymentService` is not `@Transactional`.** Each DB step is its own short transaction in
+  `PaymentTransitions` / `IdempotencyService`, and the bank call sits **between** transactions. No
+  connection or row lock is held while waiting on the network (see "never hold a row lock across a
+  network call" in the ledger notes). Separate beans also avoid Spring's self-invocation trap, where
+  calling a `@Transactional` method on `this` skips the proxy.
+- **The approval is one transaction:** payment → CAPTURED, the ledger capture entry, and the key →
+  COMPLETED with the response. If any part fails, all of it rolls back, and the payment stays
+  PENDING/UNKNOWN for a retry or the reconciler. There is no state where money is in the ledger but
+  the key still says "in progress", or the reverse.
+- **The PENDING row is committed before the bank call**, so if the process dies mid-call the
+  reconciler can still find the payment.
+- **`saveAndFlush` before the ledger:** a concurrent transition fails on `@Version` before the
+  ledger's account locks are taken. It also means the payment row is locked **before** the accounts,
+  the same order refunds use (`FOR UPDATE` on the payment first), so the two paths can't deadlock.
+- **The payment id is a UUID generated in the app,** so the same id goes to the bank and becomes the
+  bank's idempotency key.
+- **A declined card is `201` with status FAILED**, not a 402 error. The payment resource was
+  created, and its status says what happened, so the response body always has one shape.
+- **Currency:** only INR has ledger accounts, so anything else is a 422, checked *before* the key is
+  claimed.
+
+### Idempotency
+`idempotency_keys(merchant_id, key, request_hash, status, response_code, response_body JSONB,
+created_at, locked_until)`, `UNIQUE (merchant_id, key)`. An IN_PROGRESS row is a **lock with an
+expiry**; a COMPLETED row holds the response to replay.
+
+| Existing row | Same request hash | Different hash |
+|---|---|---|
+| none | insert → go | — |
+| COMPLETED | **replay** stored response + `Idempotent-Replayed: true` | **422** `IDEMPOTENCY_KEY_REUSED` |
+| IN_PROGRESS, `locked_until` in the future | **409** `IDEMPOTENCY_KEY_IN_USE` | 422 |
+| IN_PROGRESS, lock expired or released | **take over** (atomic `UPDATE ... WHERE locked_until <= now()`) → go; lost the race → 409 | 422 |
+
+- **`INSERT ... ON CONFLICT DO NOTHING` instead of catching the unique violation.** Same semantics,
+  but a failed INSERT aborts the whole Postgres transaction (every later statement errors until
+  rollback), while `DO NOTHING` just reports 0 rows. If another transaction inserted the same key and
+  hasn't committed yet, the INSERT **waits** for it, then does nothing. That's why 20 simultaneous
+  requests produce exactly one winner.
+- **The hash is compared first.** A key reused for a different request is a client bug, whatever
+  state the first request is in.
+- **Request hash = SHA-256 of `METHOD path` + the parsed DTO re-serialized.** Hashing the parsed
+  request, not raw bytes, means whitespace or field order in the client's JSON doesn't turn an
+  identical retry into a 422 (tested). Including the path means one key can't be reused across
+  endpoints, e.g. a payment and a refund.
+- **Lock expiry uses Postgres' `now()`**, not the app clock, so all instances agree. The `IdempotencyRecord` gets
+  `locked_until <= now()` as a computed boolean, which keeps the decision a pure function
+  (`IdempotencyService.decide`) that's unit-tested without a clock.
+- **JSONB gotcha:** `response_body` is JSONB, which stores objects in its own key order (by length,
+  then alphabetically). Returning the stored text would reorder the fields, so replays wouldn't be
+  byte-identical. The replay deserializes the stored JSON back into the endpoint's response record and
+  re-serializes it. The integration test asserts byte-for-byte equality.
+- **What gets stored:** only requests that *had an effect*. A declined payment is stored (a FAILED
+  payment exists). A refund rejected before changing anything (404, not refundable, over-refund) has
+  its key row deleted, so the client can fix the amount and retry with the same key. A crash
+  mid-request needs no cleanup: the lock expires after `lock-ttl` (10 s) and a retry takes over.
+- **Not built yet:** expiring old keys (Stripe keeps them 24 h). It would be a nightly
+  `DELETE ... WHERE created_at < now() - interval '24 hours'` job with an index on `created_at`.
+
+### Timeouts, UNKNOWN, and the reconciler
+A timeout is **not** a decline. The bank may have charged the card and only the response was lost.
+Marking it FAILED would let the customer pay twice (they'd retry with another card), so the payment
+becomes **UNKNOWN**, and the response is **202** with that status.
+
+Two things resolve it, and both rely on mock-bank being idempotent on `paymentId`:
+1. **The client retries with the same Idempotency-Key.** The UNKNOWN step *released* the key's lock,
+   so the retry takes it over, **finds the payment it created before** (`UNIQUE (merchant_id,
+   idempotency_key)` on payments), and charges the same `paymentId` again. The bank returns its
+   stored decision instead of charging twice, and the retry records it. Tested: two `/charge` calls
+   with the same `paymentId`, one payment, one ledger entry.
+2. **`PaymentReconciler`** runs every 10 s. It takes UNKNOWN payments, and PENDING ones left behind
+   by a crash, once they've been unresolved for 5 s. For each one it calls `GET /charges/{id}` and
+   records the answer. 404 means the bank never received the charge, so no money moved → FAILED
+   (`not_received_by_bank`). It also completes the idempotency key, so a late client retry gets the
+   final answer as a replay.
+
+**The key lock is the mutex.** Before touching a payment, the reconciler takes that payment's
+idempotency-key lock, exactly like a client retry does. So a retry and the reconciler (or two
+reconciler instances) can never drive the same payment at once. Without this, the reconciler could
+see 404 and mark FAILED while a concurrent retry's charge was being approved. If the bank is
+unreachable, the reconciler releases the lock and tries again next run. `@Version` is a second guard.
+
+- **Why the lock TTL (10 s) must exceed the slowest request:** a request past its TTL could lose its
+  lock to the reconciler while still waiting on the bank. The bank read timeout (2 s) bounds every
+  request, which leaves plenty of margin.
+- **Why the reconciler's query has literal statuses:** `WHERE status IN ('PENDING', 'UNKNOWN')` has
+  to match the partial index's predicate. With bind parameters, a cached generic plan can't prove the
+  match and can't use the index. That's also why it's SQL (`PaymentQueryRepository`), not a derived
+  JPA query.
+- **Why the JDK HTTP client is pinned to HTTP/1.1:** on plain HTTP it otherwise attempts an h2c
+  upgrade, and WireMock's Jetty answered with `RST_STREAM`, which surfaced as random "bank
+  unavailable" errors in tests. An internal JSON call gains nothing from HTTP/2.
+- **Virtual threads:** request handling runs on virtual threads (`spring.threads.virtual.enabled`), so a
+  request blocked on the bank for 2 s parks its virtual thread instead of occupying one of Tomcat's
+  200 platform threads. The blocking `RestClient` code stays simple.
+
+### Refunds: reversing entries that telescope
+`POST /v1/payments/{id}/refunds {amount}` (idempotent, same mechanism). A refund is the **mirror image
+of the capture**: credit `CUSTOMER_FUNDS`, debit `PLATFORM_FEES` for the fee returned, debit
+`MERCHANT_PAYABLE` for the rest. So the fee is returned along with the payment.
+
+**Returning the fee without rounding drift.** Rounding each partial refund's fee on its own leaks:
+49 + 49 refunded returns 0 + 0, although the fee on 98 was 1. Instead,
+`Fees.refundFee(before, amount) = fee(before + amount) − fee(before)`. The sum telescopes, so however
+a payment is split into refunds, the fees returned add up to **exactly** the capture fee. Each step
+is ≥ 0 because the fee never decreases as the amount grows. A full refund therefore leaves the
+merchant with exactly what the payment credited. Without this, a merchant with no other balance
+could hit the `balance >= 0` CHECK on its last refund. (`FeesTest` splits 9,999 into
+49 + 49 + 1 + 9,900 and checks the total is 199.)
+
+**One transaction, payment row locked first:** `SELECT ... FOR UPDATE` on the payment → must be
+CAPTURED (409) → `amount ≤ amount − refunded_amount` (422) → insert refund → bump
+`refunded_amount` → reversing ledger entry → key COMPLETED. The lock is the "lock a common parent
+row" fix measured in the ledger notes: under READ COMMITTED, the second of two concurrent refunds
+waits, then reads the refunded amount the first one committed. Tested with 5 concurrent refunds of
+6,000 on a 10,000 payment: exactly one succeeds. `CHECK (refunded_amount BETWEEN 0 AND amount)` is the
+database backstop even if the Java check were bypassed (also tested).
+
+Simplification: refunds don't call the bank. A real gateway would send a refund to the processor
+and could hit the same timeout problem there.
+
+### Listing: keyset pagination
+`GET /v1/payments?status=&from=&to=&cursor=&limit=` returns `{data, nextCursor}`, newest first.
+
+- **Keyset, not OFFSET.** The cursor is the `(created_at, id)` of the last row returned, and the next
+  page is `WHERE (created_at, id) < (:ts, :id) ORDER BY created_at DESC, id DESC LIMIT n+1`. The row
+  comparison is an index condition, so page 5,000 costs the same as page 1. OFFSET has to walk and
+  throw away every skipped row, and it shows duplicates or skips rows when payments arrive between page loads.
+- **`id` breaks ties** between payments created in the same microsecond. Without it, rows sharing a
+  timestamp at a page boundary would be skipped or repeated. The IT seeds duplicate timestamps and
+  checks that walking all pages returns every payment exactly once, compared against Postgres' own
+  `ORDER BY` (Java's `UUID.compareTo` orders differently from Postgres' uuid comparison).
+- **One extra row** (`LIMIT n+1`) says whether there is a next page, with no `COUNT(*)`.
+- **The cursor is opaque** (base64url of `epochMicros:uuid`) so it can change format later. It keeps
+  microseconds, because that's Postgres' precision. `Payment` truncates its timestamps to microseconds
+  so the entity equals what is read back.
+- Written as SQL in `PaymentQueryRepository`, so the statement is exactly the one measured below.
+
+#### EXPLAIN ANALYZE on 1M payments
+Postgres 16 (`postgres:16`, default settings), 1,000,000 payments from `infra/scripts/seed-payments.sql`:
+Chai Point 599,332, Book Nook 300,438, Pixel Prints 100,232, spread over 365 days, 88% CAPTURED.
+After `VACUUM ANALYZE`, warm cache. Queried as Chai Point, `LIMIT 21` (page size 20 + 1).
+Reproduce with `make seed-payments explain-payments`.
+
+| Query | Without `payments_merchant_created_idx` | With it |
+|---|---|---|
+| First page | 55.9 ms, parallel seq scan + top-N sort | **0.045 ms**, index scan, 23 buffers |
+| Page 5,001 (cursor 100,000 rows deep) | 53.0 ms, parallel seq scan + top-N sort | **0.036 ms**, index scan, 24 buffers |
+| Page 5,001 with `OFFSET 100001` instead | — | 206.5 ms, index scan reading 100,022 rows, 100,822 buffers |
+| `status=FAILED`, first page | 28.9 ms | **0.33 ms**, index scan + filter (200 rows skipped) |
+
+Without the index, every page is a full scan of the table, sorting all of the merchant's ~600k rows
+for the top 21:
+```
+Limit (actual time=52.850..55.848 rows=21 loops=1)
+  ->  Gather Merge (actual time=52.849..55.845 rows=21 loops=1)
+        Workers Launched: 2
+        ->  Sort (actual time=51.506..51.508 rows=19 loops=3)
+              Sort Key: created_at DESC, id DESC
+              Sort Method: top-N heapsort  Memory: 29kB
+              ->  Parallel Seq Scan on payments (actual time=0.024..30.413 rows=199777 loops=3)
+                    Filter: (merchant_id = 1)
+                    Rows Removed by Filter: 133557
+Execution Time: 55.868 ms
+```
+The planner ignores `UNIQUE (merchant_id, idempotency_key)` here even though it starts with
+`merchant_id`. This merchant is 60% of the table, and that index has no useful order, so a seq scan
+plus sort is cheaper.
+
+With the index, the deep page reads 21 index entries. The cursor is part of the `Index Cond`, and
+there is no Sort node because the index is already in `created_at DESC, id DESC` order:
+```
+Limit (actual time=0.009..0.032 rows=21 loops=1)
+  Buffers: shared hit=21 read=3
+  ->  Index Scan using payments_merchant_created_idx on payments (actual time=0.009..0.031 rows=21 loops=1)
+        Index Cond: ((merchant_id = 1) AND (ROW(created_at, id) < ROW('2026-07-29 05:43:10.929081+00'::timestamptz,
+                     '5179cba9-9064-4c60-9b12-9906e6a2020a'::uuid)))
+Execution Time: 0.036 ms
+```
+The same page with OFFSET, even with the index, walks and discards 100,001 rows:
+```
+Limit (actual time=206.510..206.526 rows=21 loops=1)
+  Buffers: shared hit=83069 read=17753 written=10884
+  ->  Index Scan using payments_merchant_created_idx on payments (actual time=0.003..203.836 rows=100022 loops=1)
+        Index Cond: (merchant_id = 1)
+Execution Time: 206.534 ms
+```
+**Status filter trade-off:** `status` is a filter on the same index, so the query reads rows in date
+order until it has 21 matches. At 12% FAILED that means ~220 rows (0.33 ms). For a rare status, it
+could read most of the merchant's rows. If filtered listing gets slow, add
+`(merchant_id, status, created_at DESC, id DESC)`, at the cost of one more index to update on every
+insert and status change.
+
+#### Other indexes used by payment endpoints and jobs
+Same 1M-row database:
+
+| Query | Index | Time |
+|---|---|---|
+| API-key authentication (`findByApiKeyHash`, every request) | `merchants_api_key_hash_key` (UNIQUE) | 0.036 ms |
+| `GET /v1/payments/{id}` (`findByIdAndMerchantId`) | `payments_pkey`, then filter on `merchant_id` | 0.036 ms |
+| Retry finds its payment (`findByMerchantIdAndIdempotencyKey`) | `payments_merchant_id_idempotency_key_key` (UNIQUE) | 0.13 ms |
+| Idempotency claim / lookup / take-over | `idempotency_keys_merchant_id_key_key` (UNIQUE) | 0.45 ms |
+| Reconciler batch | `payments_unresolved_idx` (partial: `WHERE status IN ('PENDING','UNKNOWN')`) | 0.018 ms |
+| Refunds of a payment; the `refunds.payment_id` FK | `refunds_payment_id_idx` | — (tiny table) |
+
+```
+Index Scan using payments_unresolved_idx on payments (actual time=0.011..0.012 rows=0 loops=1)
+  Index Cond: (updated_at <= (now() - '00:00:05'::interval))
+  Buffers: shared read=1
+Execution Time: 0.018 ms
+```
+**Why a partial index for the reconciler:** it only ever wants the handful of unresolved payments.
+A partial index contains only those rows, so it stays one or two pages however many millions of
+settled payments exist. A payment leaves the index automatically when it becomes CAPTURED or FAILED.
+
+### Errors and OpenAPI
+- **One error shape everywhere:** `{"error": {"code", "message"}}`. `GlobalExceptionHandler` maps
+  `ApiException` (the code and status come from the service), bean-validation failures (field-level
+  messages), missing `Idempotency-Key`, malformed JSON, `@Version` conflicts (409 `CONCURRENT_UPDATE`),
+  and Spring MVC's own exceptions (404/405/415 keep their status). Anything else is a logged 500 with
+  a generic message, so internals never leak.
+- **Gotcha:** once a controller method has constraint annotations on plain parameters (`@Size` on the
+  `Idempotency-Key` header, `@Min` on `limit`), Spring 6.1 validates the whole method in one pass. A
+  bad `@Valid` body then arrives as `HandlerMethodValidationException` with `ParameterErrors`, not as
+  `MethodArgumentNotValidException`. The handler reads field errors from both.
+- **springdoc:** security schemes `ApiKey` (header `X-Api-Key`), `AdminBasic` and `ServiceToken`, so
+  Swagger UI's Authorize button works for every endpoint. `Idempotency-Key` is documented as a
+  required header with its replay/409/422 semantics. Every status code has an `ApiError` schema and
+  an example, and the `Idempotent-Replayed` response header is documented. `GatewayApiApplicationIT`
+  checks all of these appear in `/v3/api-docs`.
+
+### Testing
+- **Unit (Mockito):** `PaymentServiceTest` (approve → recorded; decline → recorded; timeout → UNKNOWN
+  and never "failed"; replay never calls the bank; a take-over re-drives the *existing* payment; a
+  payment the reconciler already resolved is returned without charging; currency check happens before the
+  key is claimed; a rejected refund frees its key). `IdempotencyServiceTest` (new / replay / 409 /
+  422, including 422 while in progress / take-over / take-over lost; replay rebuilds the body from
+  JSONB-ordered JSON). `RefundServiceTest`, `PaymentCursorTest`, `ApiKeyAuthenticationProviderTest`,
+  plus refund cases in `LedgerServiceTest` and `FeesTest`. mock-bank: `ChargeServiceTest`.
+- **Security (`SecurityIT`, MockMvc + spring-security-test `httpBasic()`):** no key / bad key → 401;
+  the seeded demo key works; merchant A reading B's payment → 404; merchant key on `/admin` → 403;
+  admin → 200; wrong admin password → 401; admin on `/v1` → 403; `/internal` without, with wrong, and
+  with the right token; public endpoints; unknown paths denied.
+- **Integration (Testcontainers Postgres + WireMock bank):**
+  - `PaymentIdempotencyIT`: same key twice → one `/charge` call, byte-identical bodies, replay header,
+    one ledger entry; different body → 422; reformatted JSON → still a replay; **20 concurrent
+    requests with one key** (300 ms bank delay) → exactly 1 bank call, 1 payment, 1 ledger entry,
+    others 409 or replay; decline stored and replayed; validation and missing-header errors.
+  - `PaymentReconcilerIT`: timeout → 202 UNKNOWN → reconciler finds APPROVED → CAPTURED + ledger +
+    later retry replays; bank never saw it → FAILED; client retry after timeout re-drives the same
+    payment; bank down during reconciliation → stays UNKNOWN, resolved on the next run.
+  - `RefundIT`: partial + full refunds return the whole fee and leave the merchant at exactly 0,
+    ledger consistent; over-refund → 422, no ledger change, key reusable; concurrent refunds can't
+    over-refund; idempotent replay; FAILED payment → 409; another merchant's → 404; DB CHECK blocks
+    over-refund from raw SQL.
+  - `PaymentListIT`: walk every page with duplicate timestamps; status and time filters; other
+    merchants' payments never appear; bad cursor / limit / status → 400.
+- `mvn -q clean verify` runs 135 tests across the modules.

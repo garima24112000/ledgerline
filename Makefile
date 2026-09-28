@@ -1,7 +1,7 @@
 COMPOSE := docker compose -f infra/docker-compose.yml
 APPS    := gateway-api webhook-dispatcher mock-bank demo-merchant
 
-.PHONY: up down build test run-all
+.PHONY: up down build test run-all seed-payments explain-payments
 
 up: ## Start Postgres, Redis and Kafka; waits until all are healthy
 	$(COMPOSE) up -d --wait
@@ -23,3 +23,9 @@ run-all: build ## Run all four apps; logs in logs/<app>.log, Ctrl+C stops them a
 		java -jar $$app/target/$$app.jar > logs/$$app.log 2>&1 & \
 	done; \
 	wait
+
+seed-payments: ## Insert 1M demo payments into the local Postgres, for EXPLAIN measurements
+	$(COMPOSE) exec -T postgres psql -U ledgerline -d ledgerline -f - < infra/scripts/seed-payments.sql
+
+explain-payments: ## EXPLAIN ANALYZE the payment list query with and without its index
+	$(COMPOSE) exec -T postgres psql -U ledgerline -d ledgerline -f - < infra/scripts/explain-list-payments.sql

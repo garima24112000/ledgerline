@@ -52,4 +52,32 @@ class FeesTest {
             assertThat((fee + 1) * 50).isGreaterThan(amount);       // and it is the largest such value
         }
     }
+
+    @Test
+    void refundFeesTelescopeToExactlyTheCaptureFee() {
+        // 9,999 captured (fee 199), refunded as 49 + 49 + 1 + 9,900: naive per-refund rounding would
+        // return 0 + 0 + 0 + 198 = 198 and leave 1 paisa stuck in PLATFORM_FEES.
+        long[] refunds = {49, 49, 1, 9_900};
+        long refunded = 0;
+        long feeReturned = 0;
+        for (long refund : refunds) {
+            long step = Fees.refundFee(refunded, refund);
+            assertThat(step).isBetween(0L, refund);
+            feeReturned += step;
+            refunded += refund;
+        }
+        assertThat(refunded).isEqualTo(9_999);
+        assertThat(feeReturned).isEqualTo(Fees.captureFee(9_999)).isEqualTo(199);
+    }
+
+    @Test
+    void firstRefundFeeIsTheCaptureFeeOfTheRefund() {
+        assertThat(Fees.refundFee(0, 10_000)).isEqualTo(200);
+        assertThat(Fees.refundFee(0, 49)).isZero();
+    }
+
+    @Test
+    void refundFeeRejectsNegativeRunningTotal() {
+        assertThatThrownBy(() -> Fees.refundFee(-1, 10)).isInstanceOf(IllegalArgumentException.class);
+    }
 }

@@ -37,10 +37,7 @@ public class LedgerService {
 
         long customerFunds = platformAccountId(AccountType.CUSTOMER_FUNDS);
         long platformFees = platformAccountId(AccountType.PLATFORM_FEES);
-        long merchantPayable = accountRepository
-                .findByOwnerTypeAndOwnerIdAndType(OwnerType.MERCHANT, merchantId, AccountType.MERCHANT_PAYABLE)
-                .orElseThrow(() -> new IllegalArgumentException("merchant " + merchantId + " has no payable account"))
-                .getId();
+        long merchantPayable = merchantPayableId(merchantId);
 
         List<PostingRequest> postings = new ArrayList<>();
         postings.add(debit(customerFunds, amount));
@@ -49,6 +46,36 @@ public class LedgerService {
             postings.add(credit(platformFees, fee));
         }
         return post(new JournalEntryRequest(paymentId, EntryType.CAPTURE, "Capture of payment " + paymentId, postings));
+    }
+
+    /**
+     * Records a refund of {@code amount} as the mirror image of the capture: credit CUSTOMER_FUNDS
+     * amount, debit PLATFORM_FEES the returned fee, debit MERCHANT_PAYABLE the rest. The returned fee
+     * comes from {@link Fees#refundFee}, so a series of partial refunds gives back exactly the
+     * capture fee, and a full refund leaves the merchant with exactly what this payment credited.
+     * Zero postings are left out, like in {@link #capture}.
+     *
+     * <p>The caller must hold the payment row lock, so {@code refundedBefore} can't change underneath.
+     *
+     * @return the id of the new journal entry
+     */
+    @Transactional
+    public long refund(UUID paymentId, long merchantId, long amount, long refundedBefore) {
+        long feeBack = Fees.refundFee(refundedBefore, amount);
+
+        long customerFunds = platformAccountId(AccountType.CUSTOMER_FUNDS);
+        long platformFees = platformAccountId(AccountType.PLATFORM_FEES);
+        long merchantPayable = merchantPayableId(merchantId);
+
+        List<PostingRequest> postings = new ArrayList<>();
+        if (amount - feeBack > 0) {
+            postings.add(debit(merchantPayable, amount - feeBack));
+        }
+        if (feeBack > 0) {
+            postings.add(debit(platformFees, feeBack));
+        }
+        postings.add(credit(customerFunds, amount));
+        return post(new JournalEntryRequest(paymentId, EntryType.REFUND, "Refund on payment " + paymentId, postings));
     }
 
     /**
@@ -99,6 +126,13 @@ public class LedgerService {
                 ledgerRepository.findUnbalancedEntryIds(),
                 ledgerRepository.findAccountIdsWithBalanceMismatch(),
                 ledgerRepository.sumOfAllBalances());
+    }
+
+    private long merchantPayableId(long merchantId) {
+        return accountRepository
+                .findByOwnerTypeAndOwnerIdAndType(OwnerType.MERCHANT, merchantId, AccountType.MERCHANT_PAYABLE)
+                .orElseThrow(() -> new IllegalArgumentException("merchant " + merchantId + " has no payable account"))
+                .getId();
     }
 
     private long platformAccountId(AccountType type) {

@@ -120,6 +120,36 @@ class LedgerServiceTest {
     }
 
     @Test
+    void fullRefundMirrorsTheCapture() {
+        ledgerService.refund(paymentId, MERCHANT_ID, 10_000, 0);
+
+        assertThat(postedEntry().type()).isEqualTo(EntryType.REFUND);
+        assertThat(postedEntry().postings()).containsExactly(
+                debit(MERCHANT_PAYABLE, 9_800),
+                debit(PLATFORM_FEES, 200),
+                credit(CUSTOMER_FUNDS, 10_000));
+    }
+
+    @Test
+    void partialRefundReturnsTheFeeDifferenceOnTheRunningTotal() {
+        // 49 already refunded (fee on 49 = 0); refunding 1 more crosses 50 (fee 1), so all of it is fee.
+        ledgerService.refund(paymentId, MERCHANT_ID, 1, 49);
+
+        assertThat(postedEntry().postings()).containsExactly(
+                debit(PLATFORM_FEES, 1),
+                credit(CUSTOMER_FUNDS, 1));
+    }
+
+    @Test
+    void smallRefundBelowTheFeeThresholdReturnsNoFee() {
+        ledgerService.refund(paymentId, MERCHANT_ID, 49, 0);
+
+        assertThat(postedEntry().postings()).containsExactly(
+                debit(MERCHANT_PAYABLE, 49),
+                credit(CUSTOMER_FUNDS, 49));
+    }
+
+    @Test
     void postLocksAccountsInIdOrderBeforeWritingAnything() {
         ledgerService.capture(paymentId, MERCHANT_ID, 10_000);
 

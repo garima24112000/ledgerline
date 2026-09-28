@@ -70,10 +70,11 @@ public class ChargeService {
         if (roll < properties.approveRate() + properties.declineRate()) {
             return Charge.of(request, ChargeStatus.DECLINED, false);
         }
-        // A timeout still has an outcome; it is drawn with the same approve:decline odds.
+        // A timeout still has an outcome; it is drawn with the same approve:decline odds. With
+        // timeouts disabled (load tests), that outcome is simply answered on time.
         double decided = properties.approveRate() + properties.declineRate();
         boolean approved = decided == 0 || random.nextDouble() * decided < properties.approveRate();
-        return Charge.of(request, approved ? ChargeStatus.APPROVED : ChargeStatus.DECLINED, true);
+        return Charge.of(request, approved ? ChargeStatus.APPROVED : ChargeStatus.DECLINED, properties.timeoutsEnabled());
     }
 
     private Duration randomLatency() {

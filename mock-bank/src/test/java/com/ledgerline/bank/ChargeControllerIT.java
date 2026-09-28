@@ -19,6 +19,14 @@ class ChargeControllerIT {
     @Autowired
     private TestRestTemplate rest;
 
+    @Autowired
+    private BankProperties properties;
+
+    @Test
+    void timeoutsAreEnabledByDefault() {
+        assertThat(properties.timeoutsEnabled()).isTrue();
+    }
+
     @Test
     void retriedChargeReturnsTheSameResult() {
         ChargeRequest request = new ChargeRequest(UUID.randomUUID(), 49_900L, "tok_visa");

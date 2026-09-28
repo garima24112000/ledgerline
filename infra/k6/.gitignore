@@ -1,0 +1,3 @@
+# Output of local runs; curated examples live in results/*.md
+results/latest/*
+!results/latest/.gitkeep

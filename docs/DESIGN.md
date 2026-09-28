@@ -478,6 +478,16 @@ Code: `mock-bank/.../bank/`.
   for the same id share one decision, and a retry returns the stored decision immediately, without
   sleeping again. Reusing an id with a different amount or card is a 409.
 - **Magic card tokens** `tok_approve`, `tok_decline`, `tok_timeout` override the dice, for demos.
+- **`BANK_TIMEOUTS_ENABLED=false`** (`bank.timeouts-enabled`, default true) turns off the synthetic
+  timeouts for load tests. A charge that rolls into the timeout bucket is answered on time, with
+  the outcome it would have had (same approve:decline odds). So the three rates still sum to 1 and
+  need no retuning, and only the latency tail changes. `tok_timeout` still times out: it is an
+  explicit request, like the other magic tokens.
+  - **Why a switch, and not `BANK_TIMEOUT_RATE=0`:** that only works if the other two rates are
+    also changed to sum to 1, which is easy to get wrong and silently changes the outcome mix.
+  - **Tests:** `ChargeServiceTest` (the timeout bucket is answered at normal latency, with its
+    drawn outcome), `TimeoutsDisabledIT` (with timeout rate 1 and a 5 s sleep, a charge still returns
+    in under 2 s), and `ChargeControllerIT` (the switch defaults to on).
 - **Randomness and sleeping are injected** (`RandomGenerator`, `Sleeper`), so unit tests are
   deterministic and never wait.
 - **Trade-off:** charges live in memory and a restart forgets them. After a restart, the reconciler's
@@ -1565,3 +1575,103 @@ timestamp, the tolerance window, malformed headers). `WebhookControllerIT`:
 - a wrong secret, another merchant's secret, a stale signature or no signature → 401;
 - an event-id header that doesn't match the body → 400;
 - `fail-rate=1` → 500, and the event is not recorded.
+
+## Load testing (k6)
+
+Code: `infra/k6/` (how to run it and how to read the numbers: `infra/k6/README.md`; curated runs:
+`infra/k6/results/`).
+
+### Decisions
+- **Arrival rate, not a VU loop.** `steady` and `spike` use `ramping-arrival-rate`: k6 starts N
+  requests per second whatever the response time, the way independent customers arrive. A fixed
+  VU loop slows down with the server ("coordinated omission") and reports a latency that looks
+  fine while real customers queue. `dropped_iterations` then shows when k6 couldn't keep up.
+- **What counts as an error.** A decline (201 FAILED), a bank timeout (202 UNKNOWN) and a 429 are
+  the API behaving correctly. Only 5xx, client timeouts and other 4xx count. One Rate metric
+  (`errors`) and `http_req_failed` (via `setResponseCallback`) use the same definition.
+- **Latency only of accepted requests.** `accepted_latency` covers 201/202 only. A 429 returns in
+  about a millisecond, so including 429s would make p99 look better the more traffic is rejected.
+- **mock-bank load profile** (0% timeouts, 20–100 ms). With the defaults, 5% of charges wait the
+  full 2 s bank timeout, so p99 is ~2 s by construction. That's the bank's behaviour, not the
+  gateway's. Timeouts are covered by the reconciler's integration tests.
+- **Duplicate storm synchronisation.** Groups of 10 VUs sleep until the same wall-clock instant
+  (`startAt + round × ROUND_MS`), so a key's requests arrive within milliseconds of each other.
+  k6 VUs share no memory, so no VU knows what the others received. Idempotency is therefore
+  proven afterwards, in `teardown()`: list the run's payments through the public API, count one
+  per key, and flag duplicates. That checks the outcome, not the status codes.
+- **No addresses or credentials in scripts.** `BASE_URL`, `API_KEYS`, `ADMIN_USERNAME` and
+  `ADMIN_PASSWORD` are required environment variables, so the same files run against a laptop, a
+  port-forward, or a k6 Job inside the cluster.
+- **Every scenario ends with a ledger audit.** `teardown()` calls `/admin/ledger/verify`. The run
+  fails unless `allEntriesBalanced` is true and `globalNet` is 0. Load is where concurrency bugs
+  show up, so the money invariants are checked right after it, not only in the integration tests.
+  - **The check never "doesn't run".** Each result is a `Rate` sample, and a failed call (401, a
+    timeout) is recorded as `false`. k6 treats a threshold with no samples as *passed*, so an
+    exception that skipped the check would otherwise look green. Verified by running with a wrong
+    admin password: both ledger thresholds fail, exit 99.
+- **`duplicate_storm`'s exact invariant: captured payments == unique keys approved.**
+  - **The client side:** a key counts as approved when a VU gets a first-hand (not replayed)
+    `CAPTURED`. There is at most one per key, because a captured payment's key is COMPLETED and
+    every later request replays it.
+  - **The server side:** `teardown()` counts this run's `CAPTURED` payments through the list API.
+  - **Comparing them:** k6 can't compare two metrics in a threshold, so both sides add to one
+    counter (−1 per approval, +1 per captured payment), whose threshold is `count==0`.
+  - **Why it needs `BANK_TIMEOUTS_ENABLED=false`:** otherwise the reconciler can capture a payment
+    that no client ever saw approved.
+- **`run-all.sh`** runs the three scenarios in order, with a cooldown between them, and saves each
+  run in `results/<UTC timestamp>/`. Failed thresholds don't stop the later scenarios; the exit
+  code reports them at the end.
+
+### Results: where the payment path saturates
+Final local measurements: MacBook, the whole stack and k6 on one machine, two PRO merchants
+(Book Nook and Pixel Prints), mock-bank without timeouts. Details are in `infra/k6/results/`.
+
+| Run | p50 / p95 / p99 | Errors | 429s | Dropped | Ledger |
+|---|---|---|---|---|---|
+| steady 200 req/s | 69 / 108 / 174 ms | 0.00% | 0 | 0 | balanced, net 0 |
+| steady 231 req/s (healthy boundary) | 71 / 118 / 176 ms | 0.00% | 0 | 0 | balanced, net 0 |
+| steady 232 req/s (first failure) | 73 / 155 / **360 ms** | 0.00% | 0 | 19 | balanced, net 0 |
+| spike 800 req/s (spike phase) | 3959 / 6038 / **6957 ms** | 0.01% | 111 | 25 378 | balanced, net 0 |
+| duplicate_storm | 148 / 284 / 535 ms | 0.00% | 0 | 0 | balanced, net 0; 600 keys → 600 payments, 527 approved = 527 captured |
+
+- **Capacity has a knee at about 230 req/s on this machine.**
+  - Up to 231 req/s, p99 stays flat (174 → 176 ms). At 232 it doubles, and k6 starts dropping
+    iterations.
+  - The median barely moves. So this is queueing on a shared resource, not slow code.
+  - Each point is a single run, so treat it as "about 230", not as exactly 231.
+- **Correctness held everywhere.** Every run ended with a balanced ledger and a global net of 0,
+  including the overloaded spike.
+- **The rate limiter doesn't protect capacity.** At 800 req/s only 111 requests got a 429. The
+  gateway slowed down first, so each merchant's *delivered* rate stayed mostly under its 200/s
+  limit. The PRO limits add up to 400 req/s, above the ~230 req/s the payment path can serve here.
+  Per-merchant limits enforce plans. Protecting capacity needs a global limit.
+- **An earlier run was invalid.** Book Nook was still FREE (20 req/s), so 39% of `steady`'s requests
+  were 429s, and only about half the load reached the payment path. Its numbers were discarded; the
+  README now says to check that every merchant in `API_KEYS` is PRO, and that `steady` shows 0 × 429.
+
+**The likely cause of the knee: two hot rows.** This comes from exploratory runs on a busier
+machine, where the effect was stronger: p99 was 2.2 s at 200 req/s. There, Hikari had up to 341
+requests waiting for one of its 10 connections, and most Postgres sessions were in
+`Lock:transactionid`/`Lock:tuple` on `SELECT ... FROM accounts ... FOR UPDATE`.
+- Every capture locks the platform-wide `CUSTOMER_FUNDS` and `PLATFORM_FEES` accounts to update
+  their cached balances. So every payment, for every merchant, queues on the same two rows, and
+  holds them until COMMIT.
+- Near that limit, the queue grows after any hiccup and drains slowly, which shows up as tail
+  latency.
+- That profiling was not repeated at the 231/232 req/s boundary.
+
+The ledger's correctness design (row locks in id order, balances updated in the same transaction)
+is what serialises it. Options, not built yet:
+- **Keep the platform-side balances out of the hot path.** Leave cached balances only on merchant
+  accounts. Derive `CUSTOMER_FUNDS`/`PLATFORM_FEES` from `SUM(postings)`, or roll them up
+  asynchronously. The deferred balance trigger still guarantees every entry balances.
+- **Split a hot account into N sub-accounts** (shards), picked at random per entry and summed when
+  read. This is the usual answer for "house" accounts.
+- **Shorten the lock hold.** `PaymentTransitions` posts the ledger entry *first*, then writes the
+  outbox row and completes the idempotency key while still holding the account locks. Posting the
+  ledger entry last would cut the time the locks are held. It would not change what the
+  transaction commits.
+- **Fail fast under overload.** A shorter Hikari `connectionTimeout`, or a global concurrency limit,
+  so excess load gets a quick 503 instead of queueing for seconds.
+- `duplicate_storm` is barely affected: 6000 requests, but only 620 did real work. Duplicates are
+  cheap (a no-op `INSERT` plus a `SELECT`, no bank call, no ledger lock).

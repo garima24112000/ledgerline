@@ -10,6 +10,7 @@ spring:
 
 # Each charge is approved, declined, or "times out" (the decision is stored, then the
 # response is delayed past the gateway's 2s read timeout). The three rates must sum to 1.
+# BANK_TIMEOUTS_ENABLED=false (load tests) answers the timeout bucket on time instead.
 bank:
   approve-rate: ${BANK_APPROVE_RATE:0.85}
   decline-rate: ${BANK_DECLINE_RATE:0.10}
@@ -17,6 +18,7 @@ bank:
   latency-min: ${BANK_LATENCY_MIN:50ms}
   latency-max: ${BANK_LATENCY_MAX:300ms}
   timeout-sleep: ${BANK_TIMEOUT_SLEEP:5s}
+  timeouts-enabled: ${BANK_TIMEOUTS_ENABLED:true}
 
 management:
   endpoints:

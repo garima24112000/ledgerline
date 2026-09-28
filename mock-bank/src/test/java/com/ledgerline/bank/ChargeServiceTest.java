@@ -19,7 +19,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 class ChargeServiceTest {
 
     private static final BankProperties PROPERTIES = new BankProperties(
-            0.85, 0.10, 0.05, Duration.ofMillis(50), Duration.ofMillis(300), Duration.ofSeconds(5));
+            0.85, 0.10, 0.05, Duration.ofMillis(50), Duration.ofMillis(300), Duration.ofSeconds(5), true);
 
     @Mock
     private RandomGenerator random;
@@ -69,6 +69,21 @@ class ChargeServiceTest {
     }
 
     @Test
+    void withTimeoutsDisabledTheTimeoutBucketIsAnsweredOnTime() {
+        BankProperties noTimeouts = new BankProperties(
+                0.85, 0.10, 0.05, Duration.ofMillis(50), Duration.ofMillis(300), Duration.ofSeconds(5), false);
+        chargeService = new ChargeService(noTimeouts, random, sleeps::add);
+        // 0.97 lands in the timeout bucket; 0.99 * 0.95 >= 0.85 means its outcome is DECLINED.
+        when(random.nextDouble()).thenReturn(0.97, 0.99);
+        when(random.nextLong(251)).thenReturn(100L);
+
+        ChargeResponse response = chargeService.charge(request("tok_visa"));
+
+        assertThat(response.status()).isEqualTo(ChargeStatus.DECLINED);
+        assertThat(sleeps).containsExactly(Duration.ofMillis(150));
+    }
+
+    @Test
     void retryReturnsTheFirstDecisionWithoutSleepingAgain() {
         ChargeRequest request = request("tok_decline");
         ChargeResponse first = chargeService.charge(request);
@@ -103,7 +118,7 @@ class ChargeServiceTest {
 
     @Test
     void ratesThatDontSumToOneAreRejected() {
-        assertThatThrownBy(() -> new BankProperties(0.9, 0.1, 0.05, Duration.ZERO, Duration.ZERO, Duration.ZERO))
+        assertThatThrownBy(() -> new BankProperties(0.9, 0.1, 0.05, Duration.ZERO, Duration.ZERO, Duration.ZERO, true))
                 .hasMessageContaining("must be 1");
     }
 

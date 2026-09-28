@@ -19,7 +19,7 @@ public class ApiKeyAuthenticationProvider implements AuthenticationProvider {
         String apiKey = (String) authentication.getCredentials();
         return merchantRepository.findByApiKeyHash(ApiKeys.hash(apiKey))
                 .map(merchant -> ApiKeyAuthenticationToken.authenticated(
-                        new MerchantPrincipal(merchant.getId(), merchant.getName())))
+                        new MerchantPrincipal(merchant.getId(), merchant.getName(), merchant.getRateLimitTier())))
                 .orElseThrow(() -> new BadCredentialsException("Invalid API key"));
     }
 

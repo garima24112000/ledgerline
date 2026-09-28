@@ -11,7 +11,7 @@
     </parent>
 
     <artifactId>gateway-api</artifactId>
-    <description>Payments REST API, idempotency, double-entry ledger, outbox relay</description>
+    <description>Payments REST API, idempotency, double-entry ledger, outbox relay, rate limiting</description>
 
     <dependencies>
         <dependency>
@@ -43,6 +43,10 @@
             <artifactId>spring-kafka</artifactId>
         </dependency>
         <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+        <dependency>
             <groupId>org.postgresql</groupId>
             <artifactId>postgresql</artifactId>
             <scope>runtime</scope>
@@ -72,6 +76,12 @@
         <dependency>
             <groupId>org.testcontainers</groupId>
             <artifactId>kafka</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- Redis has no dedicated Testcontainers module; GenericContainer comes from the core artifact. -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers</artifactId>
             <scope>test</scope>
         </dependency>
         <!-- Stubs mock-bank in integration tests: exact responses, real delays, request counting. -->

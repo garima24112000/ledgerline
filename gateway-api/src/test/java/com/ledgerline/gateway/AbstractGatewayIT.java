@@ -18,13 +18,18 @@ import com.ledgerline.gateway.security.ApiKeys;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.UUID;
 import org.junit.jupiter.api.BeforeEach;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.test.autoconfigure.actuate.observability.AutoConfigureObservability;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.boot.web.servlet.context.ServletWebServerApplicationContext;
+import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
@@ -33,16 +38,19 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.kafka.KafkaContainer;
 
 /**
- * Shared setup for gateway integration tests: one Postgres container, one Kafka container and one
+ * Shared setup for gateway integration tests: one Postgres, one Kafka and one Redis container and one
  * WireMock "bank" for the whole run (started once, reused by every subclass), and one Spring context, because every
  * subclass has the same configuration.
  *
  * <p>Ledger rows can't be deleted, so tests never clean up. Each test creates its own merchant and
- * asserts only on that merchant's data, or on changes to shared rows.
+ * asserts only on that merchant's data, or on changes to shared rows. Merchants are PRO unless a test
+ * asks for FREE, whose limit is lowered here (1 request/s, burst 5) so rate-limit tests are quick and
+ * not timing-sensitive.
  */
 @AutoConfigureMockMvc
 @AutoConfigureObservability // metrics export (/actuator/prometheus) is off in tests by default
@@ -50,8 +58,13 @@ import org.testcontainers.kafka.KafkaContainer;
         "gateway.reconciler.enabled=false", // tests call reconcileOnce() themselves
         "gateway.reconciler.min-age=0s",
         "gateway.outbox.relay-enabled=false", // tests call relayOnce() themselves
-        "gateway.bank.read-timeout=1s"})
+        "gateway.bank.read-timeout=1s",
+        "gateway.rate-limit.tiers.FREE.rate-per-second=" + AbstractGatewayIT.TEST_FREE_RATE,
+        "gateway.rate-limit.tiers.FREE.burst=" + AbstractGatewayIT.TEST_FREE_BURST})
 public abstract class AbstractGatewayIT {
+
+    protected static final int TEST_FREE_RATE = 1;
+    protected static final int TEST_FREE_BURST = 5;
 
     protected static final String ADMIN_USER = "admin";
     protected static final String ADMIN_PASSWORD = "admin-dev-password";
@@ -59,11 +72,13 @@ public abstract class AbstractGatewayIT {
 
     protected static final PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16-alpine");
     protected static final KafkaContainer kafka = new KafkaContainer("apache/kafka:3.9.1");
+    protected static final GenericContainer<?> redis = new GenericContainer<>("redis:7-alpine").withExposedPorts(6379);
     protected static final WireMockServer bank = new WireMockServer(options().dynamicPort());
 
     static {
         postgres.start();
         kafka.start();
+        redis.start();
         bank.start();
     }
 
@@ -73,7 +88,38 @@ public abstract class AbstractGatewayIT {
         registry.add("spring.datasource.username", postgres::getUsername);
         registry.add("spring.datasource.password", postgres::getPassword);
         registry.add("spring.kafka.bootstrap-servers", kafka::getBootstrapServers);
+        registry.add("spring.data.redis.host", redis::getHost);
+        registry.add("spring.data.redis.port", () -> redis.getMappedPort(6379));
         registry.add("gateway.bank.base-url", bank::baseUrl);
+    }
+
+    /**
+     * Starts another gateway instance on the same containers, like a second replica. The caller
+     * closes it. {@code overrides} replace any of the shared settings, e.g. to point at a dead Redis.
+     */
+    protected static ConfigurableApplicationContext startAnotherInstance(Map<String, Object> overrides) {
+        Map<String, Object> properties = new HashMap<>(Map.of(
+                "server.port", 0,
+                "spring.datasource.url", postgres.getJdbcUrl(),
+                "spring.datasource.username", postgres.getUsername(),
+                "spring.datasource.password", postgres.getPassword(),
+                "spring.kafka.bootstrap-servers", kafka.getBootstrapServers(),
+                "spring.data.redis.host", redis.getHost(),
+                "spring.data.redis.port", redis.getMappedPort(6379),
+                "gateway.bank.base-url", bank.baseUrl()));
+        properties.putAll(Map.of(
+                "gateway.reconciler.enabled", false,
+                "gateway.outbox.relay-enabled", false,
+                "gateway.rate-limit.tiers.FREE.rate-per-second", TEST_FREE_RATE,
+                "gateway.rate-limit.tiers.FREE.burst", TEST_FREE_BURST));
+        properties.putAll(overrides);
+        // As command-line args: builder.properties(...) only sets defaults, which application.yml overrides.
+        String[] args = properties.entrySet().stream().map(e -> "--" + e.getKey() + "=" + e.getValue()).toArray(String[]::new);
+        return new SpringApplicationBuilder(GatewayApiApplication.class).run(args);
+    }
+
+    protected static String baseUrl(ConfigurableApplicationContext instance) {
+        return "http://localhost:" + ((ServletWebServerApplicationContext) instance).getWebServer().getPort();
     }
 
     @Autowired
@@ -96,11 +142,15 @@ public abstract class AbstractGatewayIT {
     protected record TestMerchant(long id, String apiKey, long payableAccountId) {
     }
 
-    /** A fresh merchant with a random API key and an INR payable account. */
+    /** A fresh PRO merchant with a random API key and an INR payable account. */
     protected TestMerchant createMerchant() {
+        return createMerchant(RateLimitTier.PRO);
+    }
+
+    protected TestMerchant createMerchant(RateLimitTier tier) {
         String apiKey = "sk_test_" + UUID.randomUUID();
         Merchant merchant = merchantRepository.save(new Merchant(
-                "Merchant " + apiKey, ApiKeys.hash(apiKey), "http://merchant.test/hooks", "secret", RateLimitTier.STANDARD));
+                "Merchant " + apiKey, ApiKeys.hash(apiKey), "http://merchant.test/hooks", "secret", tier));
         long payable = accountRepository.save(Account.merchantPayable(merchant.getId(), "INR")).getId();
         return new TestMerchant(merchant.getId(), apiKey, payable);
     }
@@ -144,6 +194,7 @@ public abstract class AbstractGatewayIT {
                 .formatted(amount, cardToken));
     }
 
+    /** {@code path} may also be an absolute URL, to call another instance. */
     protected ResponseEntity<String> getAs(TestMerchant merchant, String path) {
         HttpHeaders headers = new HttpHeaders();
         headers.set("X-Api-Key", merchant.apiKey());

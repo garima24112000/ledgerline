@@ -2,6 +2,7 @@ package com.ledgerline.gateway.payment;
 
 import com.ledgerline.gateway.api.ApiError;
 import com.ledgerline.gateway.idempotency.IdempotentResponse;
+import com.ledgerline.gateway.ratelimit.RateLimitFilter;
 import com.ledgerline.gateway.security.MerchantPrincipal;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
@@ -21,6 +22,7 @@ import jakarta.validation.constraints.Size;
 import java.time.Instant;
 import java.util.UUID;
 import org.springframework.format.annotation.DateTimeFormat;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -39,6 +41,16 @@ import org.springframework.web.bind.annotation.RestController;
 @ApiResponse(responseCode = "401", description = "Missing or invalid X-Api-Key",
         content = @Content(schema = @Schema(implementation = ApiError.class),
                 examples = @ExampleObject(value = PaymentController.UNAUTHORIZED_EXAMPLE)))
+@ApiResponse(responseCode = "429", description = """
+        Rate limit for the merchant's tier exceeded (FREE: 20 requests/s, burst 40; PRO: 200/s, burst 400).
+        Successful responses carry `X-RateLimit-Remaining` too.""",
+        headers = {
+                @Header(name = HttpHeaders.RETRY_AFTER, description = "Seconds until a request will be allowed again",
+                        schema = @Schema(type = "integer")),
+                @Header(name = RateLimitFilter.REMAINING_HEADER, description = "Requests left in the current burst",
+                        schema = @Schema(type = "integer"))},
+        content = @Content(schema = @Schema(implementation = ApiError.class),
+                examples = @ExampleObject(value = PaymentController.RATE_LIMITED_EXAMPLE)))
 public class PaymentController {
 
     static final String IDEMPOTENCY_KEY_DESCRIPTION = """
@@ -49,6 +61,9 @@ public class PaymentController {
 
     static final String UNAUTHORIZED_EXAMPLE = """
             {"error": {"code": "UNAUTHORIZED", "message": "Missing or invalid credentials"}}""";
+
+    static final String RATE_LIMITED_EXAMPLE = """
+            {"error": {"code": "RATE_LIMITED", "message": "Too many requests for your plan (FREE); retry after the Retry-After header"}}""";
 
     private static final String PAYMENT_EXAMPLE = """
             {"id": "3f1c2a9e-6f0a-4a57-9a51-2f4f5f7a0c11", "status": "CAPTURED", "amount": 49900, "currency": "INR",

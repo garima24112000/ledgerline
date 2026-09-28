@@ -15,7 +15,7 @@ class GatewayApiApplicationIT extends AbstractGatewayIT {
 
     @Test
     void flywayAppliesAllMigrations() {
-        assertThat(flyway.info().current().getVersion().getVersion()).isEqualTo("4");
+        assertThat(flyway.info().current().getVersion().getVersion()).isEqualTo("5");
     }
 
     @Test
@@ -48,5 +48,12 @@ class GatewayApiApplicationIT extends AbstractGatewayIT {
 
         assertThat(docs).contains("\"ApiKey\"", "\"X-Api-Key\"", "\"AdminBasic\"", "\"ServiceToken\"");
         assertThat(docs).contains("\"Idempotency-Key\"", "Idempotent-Replayed", "\"ApiError\"");
+    }
+
+    @Test
+    void openApiDocumentsTheRateLimitResponse() {
+        String docs = rest.getForObject("/v3/api-docs", String.class);
+
+        assertThat(docs).contains("\"429\"", "RATE_LIMITED", "\"Retry-After\"", "\"X-RateLimit-Remaining\"");
     }
 }

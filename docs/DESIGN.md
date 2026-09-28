@@ -39,9 +39,9 @@ Swagger UI at `/swagger-ui.html`.
 - **Maven multi-module with one parent pom.** The parent inherits `spring-boot-starter-parent` 3.3.13
   so all modules share one dependency set. Dependencies every app needs (web, actuator,
   Prometheus registry, test starter) are declared once in the parent.
-- **Dependencies arrive with the features that use them.** For example, the Redis client is not on
-  the classpath yet, so auto-configuration doesn't try to connect to a service nothing uses. Kafka
-  arrived with the outbox (gateway-api) and the dispatcher.
+- **Dependencies arrive with the features that use them**, so auto-configuration never connects to
+  a service nothing uses. Kafka arrived with the outbox (gateway-api) and the dispatcher, and Redis
+  with rate limiting.
 
 ### Database
 - **Flyway owns the schema, Hibernate only validates it** (`ddl-auto: validate`). This fits the
@@ -49,7 +49,8 @@ Swagger UI at `/swagger-ui.html`.
   migrations, never generated. `V1__init.sql` is an empty baseline; `V2__ledger.sql` adds merchants
   and the ledger (see [Ledger](#ledger)); `V3__payments.sql` adds payments, refunds, idempotency keys
   and the demo merchants (see [Payments](#payments)); `V4__outbox.sql` adds the transactional outbox
-  (see [Outbox](#outbox)).
+  (see [Outbox](#outbox)); `V5__rate_limit_tiers.sql` reduces the tiers to FREE and PRO (see
+  [Rate limiting](#rate-limiting)).
 - Flyway 10 needs `flyway-database-postgresql` alongside `flyway-core`.
 - `open-in-view: false`, so no lazy loading can happen in the web layer, and each transaction
   boundary is explicit in the service layer.
@@ -498,6 +499,9 @@ ride on), with three ways in:
 | `X-Service-Token` | `ServiceTokenAuthenticationFilter` → `ServiceTokenAuthenticationProvider` | `SERVICE` | `/internal/**` |
 | HTTP Basic | Spring's `BasicAuthenticationFilter` → `DaoAuthenticationProvider` | `ADMIN` | `/admin/**` |
 
+After authorization, `RateLimitFilter` applies the merchant's rate limit (see
+[Rate limiting](#rate-limiting)).
+
 Public: `/actuator/health/**`, `/actuator/prometheus`, `/v3/api-docs/**`, `/swagger-ui/**`. Everything
 else is `denyAll()`.
 
@@ -893,6 +897,144 @@ settled payments exist. A payment leaves the index automatically when it becomes
   - `PaymentListIT`: walk every page with duplicate timestamps; status and time filters; other
     merchants' payments never appear; bad cursor / limit / status → 400.
 - Test totals for the whole build are at the end of [Webhooks › Testing](#testing-4).
+
+## Rate limiting
+
+Code: `gateway-api/.../ratelimit/`, script `resources/ratelimit/token_bucket.lua`, schema `V5__rate_limit_tiers.sql`.
+
+| Tier | Sustained rate | Burst |
+|---|---|---|
+| FREE | 20 requests/s | 40 |
+| PRO | 200 requests/s | 400 |
+
+Limits are config (`gateway.rate-limit.tiers`), and the tier is a column on `merchants`.
+`RateLimitProperties` fails startup if a tier has no limit.
+
+- A `/v1` request within the limit gets `X-RateLimit-Remaining`.
+- A request over it gets **429** with:
+  - `Retry-After` (whole seconds, rounded up, at least 1),
+  - `X-RateLimit-Remaining: 0`,
+  - the usual error body with code `RATE_LIMITED`.
+
+### Tiers: FREE and PRO
+V2 had `FREE / STANDARD / PREMIUM`, but only two limits were specified. V5 moves STANDARD and PREMIUM
+merchants to **PRO**, so nobody's limit goes down, and replaces the CHECK. The old CHECK has to be dropped
+*before* the `UPDATE`, because it rejects `'PRO'`. Flyway runs the migration in one transaction, so no
+other session sees the table without a CHECK. New merchants default to FREE.
+
+### Token bucket in one Lua script
+Each merchant has a bucket of `burst` tokens that refills at `rate` tokens per second. A request
+takes one token or is rejected.
+- **Why a token bucket.** A fixed window (`INCR` a counter per second) lets through 2× the limit
+  across a window boundary. A sliding log is exact, but stores one entry per request. A token bucket
+  is two numbers per merchant. It allows short bursts, which real clients produce (a page load fans
+  out several calls), while holding the average to `rate`.
+- **Why Lua.** Refill-then-take is read, compute, write. Done from Java as `HGET` then `HSET`, two
+  instances can both read "1 token left" and both take it. `MULTI/EXEC` can't help, because a
+  transaction can't branch on a value it read. Redis runs a script to completion before any other
+  command, so the whole step is atomic across all gateway instances. Spring sends `EVALSHA` and
+  falls back to `EVAL` once if Redis doesn't have the script cached yet.
+- **State:**
+  - A `HASH` at `ratelimit:merchant:{id}` holds `tokens` (fractional) and `ts_ms`.
+  - A missing key means a full bucket.
+  - `PEXPIRE` is set to the time a full refill takes, plus 1 s. By then the bucket would be full
+    anyway, so idle merchants use no memory.
+- **Redis' clock (`TIME`), not the app's.** All instances then agree on "now", as with Postgres
+  `now()` for idempotency locks. With app clocks, a skewed instance would refill buckets too fast
+  or too slowly. `max(0, elapsed)` guards against the clock stepping back.
+- **Milliseconds, not microseconds.** Lua's `tostring` keeps 14 significant digits.
+  - A millisecond timestamp has 13 digits and is stored exactly.
+  - A microsecond timestamp has 16 digits and would be silently rounded.
+  - One millisecond is fine even at 200/s, where a token takes 5 ms.
+
+### Where the filter sits
+`RateLimitFilter` is added to the security chain **after `AuthorizationFilter`**:
+- It knows the merchant and tier. `MerchantPrincipal` carries the tier from the same indexed
+  `api_key_hash` lookup authentication already does, so there is no extra query, and there is no new
+  index to justify. A tier change applies from the merchant's next request.
+- Bad keys (401) and forbidden paths (403) are rejected first and don't use tokens, so nobody can
+  drain a merchant's bucket without its key.
+- Only `MerchantPrincipal` requests are limited. Admin, service and public requests pass through.
+- It is created in `SecurityConfig` rather than declared as a bean. Spring Boot registers every
+  `Filter` bean as a servlet filter too, so it would also run a second time, outside security.
+
+### Redis down: fail open
+If the script call throws (connection refused, timeout), the request is **allowed**,
+`rate_limiter_errors_total` is incremented and a warning is logged.
+
+**The trade-off:** availability over protection.
+- The rate limit protects the gateway from overload and enforces plan limits. The payments API is
+  the product. Failing closed would turn a Redis outage (a cache, in a supporting role) into a total
+  outage for every merchant: a small dependency would take down the core function.
+- **What failing open costs:** while Redis is down, nobody is limited. A misbehaving client could
+  send unlimited traffic. That is bounded in practice:
+  - Hikari's 10-connection pool per instance limits database load.
+  - The bank client has timeouts.
+  - The outage is visible at once: alert on `rate(rate_limiter_errors_total[1m]) > 0`.
+- **When fail-closed is right:** when the limit guards something that must never be exceeded, such
+  as a paid third-party quota or brute-force protection on logins. Neither applies here.
+- **A middle ground, not built:** a local in-memory bucket per instance as a fallback (limit ÷
+  instance count). It gives rough protection during an outage, at the cost of a second code path
+  that is rarely exercised.
+
+Making fail-open actually fast and safe took three settings:
+- **`management.health.redis.enabled: false`.** Adding the Redis starter adds Redis to
+  `/actuator/health`. Kubernetes would then mark every pod unready while Redis is down: failing
+  closed by another route.
+- **Lettuce `DisconnectedBehavior.REJECT_COMMANDS`** (`RedisConfig`). By default Lettuce queues
+  commands while it reconnects, so every request would wait the full command timeout before failing
+  open. With this setting it fails at once. The customizer repeats Boot's socket and timeout
+  options, because setting `clientOptions` replaces them.
+- **`spring.data.redis.timeout: 100ms`** bounds the cost when Redis is reachable but slow.
+
+### Metrics
+| Metric | Meaning |
+|---|---|
+| `rate_limited_requests_total{merchant,tier}` | 429s returned |
+| `rate_limiter_errors_total` | checks that failed, so the request was allowed |
+
+**Cardinality:** a `merchant` label creates one time series per limited merchant. That is fine for
+a small-merchant gateway with a few thousand merchants, and it answers "who is hitting their limit?"
+directly. At a much larger scale, the label would go. The per-merchant detail would move to logs, or
+to a top-k query over a separate store.
+
+### Why it's built this way (interview notes)
+#### Why is the limit shared through Redis rather than kept in each instance?
+A limiter per instance allows `limit × instances`, and that changes whenever Kubernetes scales.
+The load balancer doesn't route one merchant to one pod, so each pod sees a random share of the
+merchant's traffic. One shared bucket gives the same answer whichever pod handles a request.
+`RateLimitIT.twoAppInstancesShareOneLimit` starts a second gateway on the same containers and
+alternates requests between the two instances: exactly `burst` succeed in total.
+
+The price is a Redis round trip on every `/v1` request (typically sub-millisecond inside a cluster), and a
+dependency, which the fail-open policy above contains.
+
+### Testing
+- **Unit:**
+  - `RateLimitFilterTest` (Mockito):
+    - allowed → the chain runs, with the remaining header;
+    - rejected → 429, the headers, the JSON body, and the counter tagged with merchant and tier;
+    - Redis exception → the chain runs and the error counter goes up;
+    - admin and anonymous requests are never checked;
+    - `enabled=false` is a no-op;
+    - `Retry-After` rounding.
+  - `RateLimitPropertiesTest`: `application.yml` binds to FREE 20/40 and PRO 200/400; a missing
+    tier or a zero value fails.
+- **Integration (Testcontainers Redis 7, added to `AbstractGatewayIT`).** FREE is lowered to
+  1/s, burst 5 in tests, so every step is well away from a timing boundary. `RateLimitIT`:
+  - **Burst:** 5 × 200, with remaining counting 4…0.
+  - **Excess:** the 6th request gets 429, `Retry-After: 1` and the metric on `/actuator/prometheus`.
+  - **Refill:** 1.1 s later, exactly one more request is allowed.
+  - **Isolation:** one merchant being limited doesn't affect another.
+  - **PRO** gets its own bucket.
+  - **Failed authentication** uses no tokens.
+  - **Two instances share one limit.**
+- `RateLimitFailOpenIT`:
+  - a second instance points at a closed port;
+  - 10 requests (twice the burst) all get 200;
+  - `rate_limiter_errors_total` = 10;
+  - `/actuator/health` stays UP.
+- `GatewayApiApplicationIT` checks that the 429 response and its headers are in `/v3/api-docs`.
 
 ## Outbox
 
@@ -1396,7 +1538,7 @@ need blocking retries per merchant, head-of-line blocking included, which is the
 - **Test HTTP client:** the dispatcher and demo-merchant have `httpclient5` as a test dependency.
   `TestRestTemplate` otherwise uses `HttpURLConnection`, which throws instead of returning a 401 to
   a POST.
-- **Whole build:** `mvn -q clean verify` runs 174 tests across the modules.
+- **Whole build:** `mvn -q clean verify` runs 191 tests across the modules.
 
 ## Demo merchant
 

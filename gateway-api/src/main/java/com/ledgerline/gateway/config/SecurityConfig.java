@@ -1,12 +1,17 @@
 package com.ledgerline.gateway.config;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.ledgerline.gateway.merchant.MerchantRepository;
+import com.ledgerline.gateway.ratelimit.RateLimitFilter;
+import com.ledgerline.gateway.ratelimit.RateLimitProperties;
+import com.ledgerline.gateway.ratelimit.RedisRateLimiter;
 import com.ledgerline.gateway.security.ApiKeyAuthenticationFilter;
 import com.ledgerline.gateway.security.ApiKeyAuthenticationProvider;
 import com.ledgerline.gateway.security.AuthProperties;
 import com.ledgerline.gateway.security.JsonSecurityErrorHandler;
 import com.ledgerline.gateway.security.ServiceTokenAuthenticationFilter;
 import com.ledgerline.gateway.security.ServiceTokenAuthenticationProvider;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.security.authentication.AuthenticationManager;
@@ -20,6 +25,7 @@ import org.springframework.security.crypto.factory.PasswordEncoderFactories;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.provisioning.InMemoryUserDetailsManager;
 import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.access.intercept.AuthorizationFilter;
 import org.springframework.security.web.authentication.www.BasicAuthenticationFilter;
 
 /**
@@ -57,9 +63,17 @@ public class SecurityConfig {
                 adminProvider);
     }
 
+    /**
+     * The rate-limit filter is created here, not declared as a bean: Spring Boot registers every
+     * {@code Filter} bean as a servlet filter too, so it would run twice, once before security.
+     * It goes after {@code AuthorizationFilter}, so bad keys (401) and forbidden paths (403) never
+     * use a merchant's tokens.
+     */
     @Bean
     SecurityFilterChain securityFilterChain(HttpSecurity http, AuthenticationManager authenticationManager,
-                                            JsonSecurityErrorHandler errors) throws Exception {
+                                            JsonSecurityErrorHandler errors, RedisRateLimiter rateLimiter,
+                                            RateLimitProperties rateLimits, MeterRegistry meterRegistry,
+                                            ObjectMapper objectMapper) throws Exception {
         return http
                 .csrf(AbstractHttpConfigurer::disable) // no cookies or sessions, so nothing for CSRF to ride on
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
@@ -69,6 +83,8 @@ public class SecurityConfig {
                         BasicAuthenticationFilter.class)
                 .addFilterBefore(new ServiceTokenAuthenticationFilter(authenticationManager, errors.entryPoint()),
                         BasicAuthenticationFilter.class)
+                .addFilterAfter(new RateLimitFilter(rateLimiter, rateLimits, meterRegistry, objectMapper),
+                        AuthorizationFilter.class)
                 .exceptionHandling(exceptions -> exceptions
                         .authenticationEntryPoint(errors.entryPoint())
                         .accessDeniedHandler(errors.accessDeniedHandler()))

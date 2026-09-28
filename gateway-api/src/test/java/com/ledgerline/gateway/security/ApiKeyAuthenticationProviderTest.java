@@ -30,7 +30,7 @@ class ApiKeyAuthenticationProviderTest {
 
     @Test
     void knownKeyAuthenticatesTheMerchantByItsHash() {
-        Merchant merchant = new Merchant("Chai Point", "unused", "http://x", "s", RateLimitTier.STANDARD);
+        Merchant merchant = new Merchant("Chai Point", "unused", "http://x", "s", RateLimitTier.PRO);
         ReflectionTestUtils.setField(merchant, "id", 42L);
         // Looked up by hash: the raw key is never stored or queried.
         when(merchantRepository.findByApiKeyHash(ApiKeys.hash("sk_test_abc"))).thenReturn(Optional.of(merchant));
@@ -38,7 +38,7 @@ class ApiKeyAuthenticationProviderTest {
         Authentication result = provider.authenticate(ApiKeyAuthenticationToken.unauthenticated("sk_test_abc"));
 
         assertThat(result.isAuthenticated()).isTrue();
-        assertThat(result.getPrincipal()).isEqualTo(new MerchantPrincipal(42L, "Chai Point"));
+        assertThat(result.getPrincipal()).isEqualTo(new MerchantPrincipal(42L, "Chai Point", RateLimitTier.PRO));
         assertThat(result.getAuthorities()).extracting(GrantedAuthority::getAuthority).containsExactly("ROLE_MERCHANT");
     }
 

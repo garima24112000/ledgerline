@@ -17,6 +17,12 @@ spring:
       ddl-auto: validate # schema is owned by Flyway, Hibernate only checks it
   flyway:
     locations: classpath:db/migration
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 100ms # a slow Redis delays each request by at most this, then the limiter fails open
+      connect-timeout: 200ms
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
     producer:
@@ -49,6 +55,15 @@ gateway:
     topic: payment.events
     partitions: 6
     replicas: ${KAFKA_REPLICATION_FACTOR:1}
+  rate-limit:
+    enabled: ${RATE_LIMIT_ENABLED:true}
+    tiers:
+      FREE:
+        rate-per-second: 20
+        burst: 40
+      PRO:
+        rate-per-second: 200
+        burst: 400
   auth:
     # Dev defaults only. Set these from secrets in any real deployment.
     admin-username: ${ADMIN_USERNAME:admin}
@@ -68,6 +83,9 @@ management:
     health:
       probes:
         enabled: true
+  health:
+    redis:
+      enabled: false # the rate limiter fails open, so Redis being down must not make the pod unhealthy
   metrics:
     tags:
       application: ${spring.application.name}

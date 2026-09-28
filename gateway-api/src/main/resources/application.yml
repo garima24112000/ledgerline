@@ -55,6 +55,7 @@ gateway:
     topic: payment.events
     partitions: 6
     replicas: ${KAFKA_REPLICATION_FACTOR:1}
+    lag-refresh: PT5S # outbox lag gauges; ISO-8601, because @Scheduled reads it as a Duration
   rate-limit:
     enabled: ${RATE_LIMIT_ENABLED:true}
     tiers:
@@ -89,3 +90,9 @@ management:
   metrics:
     tags:
       application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        "[http.server.requests]": true # buckets, so Grafana can aggregate p50/p95/p99 across instances
+  tracing:
+    sampling:
+      probability: 1.0 # no exporter is configured; tracing only supplies traceId/spanId for logs and propagation

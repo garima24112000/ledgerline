@@ -4,11 +4,15 @@ import com.ledgerline.gateway.api.ApiException;
 import com.ledgerline.gateway.idempotency.Claim;
 import com.ledgerline.gateway.idempotency.IdempotencyService;
 import com.ledgerline.gateway.idempotency.IdempotentResponse;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import java.time.Instant;
 import java.util.List;
+import java.util.Locale;
 import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 
@@ -30,16 +34,18 @@ public class PaymentService {
     private final PaymentTransitions transitions;
     private final RefundService refundService;
     private final BankClient bankClient;
+    private final MeterRegistry meterRegistry;
 
     public PaymentService(IdempotencyService idempotencyService, PaymentRepository paymentRepository,
                           PaymentQueryRepository paymentQueryRepository, PaymentTransitions transitions,
-                          RefundService refundService, BankClient bankClient) {
+                          RefundService refundService, BankClient bankClient, MeterRegistry meterRegistry) {
         this.idempotencyService = idempotencyService;
         this.paymentRepository = paymentRepository;
         this.paymentQueryRepository = paymentQueryRepository;
         this.transitions = transitions;
         this.refundService = refundService;
         this.bankClient = bankClient;
+        this.meterRegistry = meterRegistry;
     }
 
     /**
@@ -48,8 +54,30 @@ public class PaymentService {
      *   <li>Create the PENDING payment, unless a take-over retry finds the one it created before.</li>
      *   <li>Charge the card, then record CAPTURED / FAILED, or UNKNOWN if the bank didn't answer.</li>
      * </ol>
+     * Timed as {@code payment_create_seconds{outcome}}: the payment's status, {@code replayed}, or
+     * {@code rejected} (an API error such as 409 or 422).
      */
     public IdempotentResponse<PaymentResponse> create(long merchantId, String idempotencyKey, CreatePaymentRequest request) {
+        Timer.Sample sample = Timer.start(meterRegistry);
+        String outcome = "error";
+        try {
+            IdempotentResponse<PaymentResponse> response = doCreate(merchantId, idempotencyKey, request);
+            outcome = response.replayed() ? "replayed" : response.body().status().name().toLowerCase(Locale.ROOT);
+            return response;
+        } catch (ApiException e) {
+            outcome = "rejected";
+            throw e;
+        } finally {
+            sample.stop(Timer.builder("payment.create")
+                    .description("POST /v1/payments in the service layer, by outcome")
+                    .tag("outcome", outcome)
+                    .publishPercentileHistogram()
+                    .register(meterRegistry));
+        }
+    }
+
+    private IdempotentResponse<PaymentResponse> doCreate(long merchantId, String idempotencyKey,
+                                                         CreatePaymentRequest request) {
         if (!SUPPORTED_CURRENCY.equals(request.currency())) {
             throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "UNSUPPORTED_CURRENCY",
                     "Currency " + request.currency() + " is not supported; use " + SUPPORTED_CURRENCY);
@@ -64,18 +92,21 @@ public class PaymentService {
         // payment it created the first time, never a second one.
         Payment payment = paymentRepository.findByMerchantIdAndIdempotencyKey(merchantId, idempotencyKey)
                 .orElseGet(() -> transitions.createPending(merchantId, idempotencyKey, request));
-        if (payment.isResolved()) {
-            return transitions.completeKeyForResolved(payment.getId());
-        }
+        // Every log line from here on (this class, the bank client, the transitions) carries paymentId.
+        try (MDC.MDCCloseable ignored = MDC.putCloseable("paymentId", payment.getId().toString())) {
+            if (payment.isResolved()) {
+                return transitions.completeKeyForResolved(payment.getId());
+            }
 
-        BankResult result;
-        try {
-            result = bankClient.charge(payment.getId(), payment.getAmount(), payment.getCardToken());
-        } catch (BankUnavailableException e) {
-            log.warn("No answer from the bank for payment {}; marking it UNKNOWN", payment.getId(), e);
-            return transitions.markUnknown(payment.getId());
+            BankResult result;
+            try {
+                result = bankClient.charge(payment.getId(), payment.getAmount(), payment.getCardToken());
+            } catch (BankUnavailableException e) {
+                log.warn("No answer from the bank for payment {}; marking it UNKNOWN", payment.getId(), e);
+                return transitions.markUnknown(payment.getId());
+            }
+            return transitions.recordBankResult(payment.getId(), result);
         }
-        return transitions.recordBankResult(payment.getId(), result);
     }
 
     public PaymentResponse get(long merchantId, UUID paymentId) {
@@ -97,18 +128,20 @@ public class PaymentService {
 
     public IdempotentResponse<RefundResponse> refund(long merchantId, UUID paymentId, String idempotencyKey,
                                                      CreateRefundRequest request) {
-        String requestHash = idempotencyService.requestHash("POST /v1/payments/" + paymentId + "/refunds", request);
-        Claim claim = idempotencyService.claim(merchantId, idempotencyKey, requestHash);
-        if (claim instanceof Claim.Replay replay) {
-            return idempotencyService.replay(replay, RefundResponse.class);
-        }
-        try {
-            RefundResponse refund = refundService.refund(merchantId, paymentId, idempotencyKey, request.amount());
-            return IdempotentResponse.fresh(HttpStatus.CREATED, refund);
-        } catch (ApiException e) {
-            // Rejected before anything changed: forget the key, so a corrected retry can use it.
-            idempotencyService.delete(merchantId, idempotencyKey);
-            throw e;
+        try (MDC.MDCCloseable ignored = MDC.putCloseable("paymentId", paymentId.toString())) {
+            String requestHash = idempotencyService.requestHash("POST /v1/payments/" + paymentId + "/refunds", request);
+            Claim claim = idempotencyService.claim(merchantId, idempotencyKey, requestHash);
+            if (claim instanceof Claim.Replay replay) {
+                return idempotencyService.replay(replay, RefundResponse.class);
+            }
+            try {
+                RefundResponse refund = refundService.refund(merchantId, paymentId, idempotencyKey, request.amount());
+                return IdempotentResponse.fresh(HttpStatus.CREATED, refund);
+            } catch (ApiException e) {
+                // Rejected before anything changed: forget the key, so a corrected retry can use it.
+                idempotencyService.delete(merchantId, idempotencyKey);
+                throw e;
+            }
         }
     }
 

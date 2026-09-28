@@ -16,13 +16,14 @@ import com.ledgerline.gateway.api.ApiException;
 import com.ledgerline.gateway.idempotency.Claim;
 import com.ledgerline.gateway.idempotency.IdempotencyService;
 import com.ledgerline.gateway.idempotency.IdempotentResponse;
+import io.micrometer.core.instrument.Timer;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.net.SocketTimeoutException;
 import java.util.Optional;
 import java.util.UUID;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.http.HttpStatus;
@@ -47,13 +48,15 @@ class PaymentServiceTest {
     @Mock
     private BankClient bankClient;
 
-    @InjectMocks
+    private final SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
     private PaymentService paymentService;
 
     private final Payment pending = Payment.pending(MERCHANT, KEY, 49_900, "INR", "tok_visa", "order-1");
 
     @BeforeEach
     void setUp() {
+        paymentService = new PaymentService(idempotencyService, paymentRepository, paymentQueryRepository, transitions,
+                refundService, bankClient, meterRegistry);
         lenient().when(idempotencyService.requestHash(anyString(), any())).thenReturn("hash");
         lenient().when(idempotencyService.claim(MERCHANT, KEY, "hash")).thenReturn(new Claim.Acquired());
         lenient().when(paymentRepository.findByMerchantIdAndIdempotencyKey(MERCHANT, KEY)).thenReturn(Optional.empty());
@@ -110,6 +113,7 @@ class PaymentServiceTest {
         unknown.markUnknown();
         when(paymentRepository.findByMerchantIdAndIdempotencyKey(MERCHANT, KEY)).thenReturn(Optional.of(unknown));
         when(bankClient.charge(unknown.getId(), 49_900, "tok_visa")).thenReturn(BankResult.approved("bnk_3"));
+        when(transitions.recordBankResult(eq(unknown.getId()), any())).thenReturn(response(HttpStatus.CREATED));
 
         paymentService.create(MERCHANT, KEY, REQUEST);
 
@@ -122,6 +126,8 @@ class PaymentServiceTest {
         Payment captured = Payment.pending(MERCHANT, KEY, 49_900, "INR", "tok_visa", "order-1");
         captured.capture("bnk_4");
         when(paymentRepository.findByMerchantIdAndIdempotencyKey(MERCHANT, KEY)).thenReturn(Optional.of(captured));
+        when(transitions.completeKeyForResolved(captured.getId()))
+                .thenReturn(IdempotentResponse.fresh(HttpStatus.CREATED, PaymentResponse.from(captured)));
 
         paymentService.create(MERCHANT, KEY, REQUEST);
 
@@ -145,6 +151,46 @@ class PaymentServiceTest {
         assertThatThrownBy(() -> paymentService.refund(MERCHANT, paymentId, KEY, new CreateRefundRequest(500L)))
                 .isInstanceOf(ApiException.class);
         verify(idempotencyService).delete(MERCHANT, KEY);
+    }
+
+    @Test
+    void createIsTimedByOutcome() {
+        Payment captured = Payment.pending(MERCHANT, KEY, 49_900, "INR", "tok_visa", "order-1");
+        captured.capture("bnk_5");
+        when(bankClient.charge(pending.getId(), 49_900, "tok_visa")).thenReturn(BankResult.approved("bnk_5"));
+        when(transitions.recordBankResult(eq(pending.getId()), any()))
+                .thenReturn(IdempotentResponse.fresh(HttpStatus.CREATED, PaymentResponse.from(captured)));
+
+        paymentService.create(MERCHANT, KEY, REQUEST);
+
+        assertThat(createTimerCount("captured")).isEqualTo(1);
+    }
+
+    @Test
+    void bankTimeoutIsTimedAsUnknown() {
+        Payment unknown = Payment.pending(MERCHANT, KEY, 49_900, "INR", "tok_visa", "order-1");
+        unknown.markUnknown();
+        when(bankClient.charge(pending.getId(), 49_900, "tok_visa"))
+                .thenThrow(new BankUnavailableException("timeout", new SocketTimeoutException()));
+        when(transitions.markUnknown(pending.getId()))
+                .thenReturn(IdempotentResponse.fresh(HttpStatus.ACCEPTED, PaymentResponse.from(unknown)));
+
+        paymentService.create(MERCHANT, KEY, REQUEST);
+
+        assertThat(createTimerCount("unknown")).isEqualTo(1);
+    }
+
+    @Test
+    void rejectedCreateIsTimedAsRejected() {
+        assertThatThrownBy(() -> paymentService.create(MERCHANT, KEY, new CreatePaymentRequest(100L, "USD", "tok", "o")))
+                .isInstanceOf(ApiException.class);
+
+        assertThat(createTimerCount("rejected")).isEqualTo(1);
+    }
+
+    private long createTimerCount(String outcome) {
+        Timer timer = meterRegistry.find("payment.create").tag("outcome", outcome).timer();
+        return timer == null ? 0 : timer.count();
     }
 
     private IdempotentResponse<PaymentResponse> response(HttpStatus status) {

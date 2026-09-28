@@ -6,6 +6,7 @@ import java.util.Optional;
 import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
@@ -63,6 +64,12 @@ public class PaymentReconciler {
     }
 
     private boolean reconcile(UUID paymentId) {
+        try (MDC.MDCCloseable ignored = MDC.putCloseable("paymentId", paymentId.toString())) {
+            return reconcileLogged(paymentId);
+        }
+    }
+
+    private boolean reconcileLogged(UUID paymentId) {
         Payment payment = paymentRepository.findById(paymentId).orElseThrow();
         if (payment.isResolved()) {
             return false;

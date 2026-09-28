@@ -17,10 +17,28 @@ project, and the design decisions and measurements are in [docs/DESIGN.md](docs/
 Needs Java 21, Maven, and Docker.
 
 ```bash
-make up        # Postgres, Redis, Kafka (docker compose), waits until healthy
+make up        # Postgres, Redis, Kafka, Prometheus, Grafana (docker compose), waits until healthy
 make run-all   # builds and starts all four apps; logs in logs/<app>.log
 make test      # unit + integration tests (Testcontainers)
 ```
+
+## Observability
+
+- **Grafana:** <http://localhost:3000/d/ledgerline>. The Prometheus datasource and the Ledgerline
+  dashboard are provisioned from `infra/grafana/`. Open it anonymously, or log in as `admin`/`admin`.
+  It shows request rate, p50/p95/p99 latency, 4xx/5xx, 429s per tier, payment/bank/ledger timings,
+  outbox lag, webhook outcomes, JVM heap and the Hikari pool.
+- **Prometheus:** <http://localhost:9090/targets>. It scrapes all four apps on the host every 5 s.
+- **Logs** are one JSON object per line, with `traceId`, `spanId` and, where it applies,
+  `paymentId` / `eventId`:
+
+  Each log file starts with Spring's text banner, so keep only the JSON lines before `jq`:
+
+  ```bash
+  grep '^{' logs/gateway-api.log | jq .                                      # pretty-print one app
+  grep -h '^{' logs/*.log | jq -c 'select(.paymentId == "<id>")'             # one payment across every app
+  SPRING_PROFILES_ACTIVE=plain-logs java -jar gateway-api/target/gateway-api.jar   # plain text instead
+  ```
 
 Swagger UI: <http://localhost:8080/swagger-ui.html>. Click **Authorize**, paste a demo key into
 `ApiKey`, and every endpoint can be tried from the browser.

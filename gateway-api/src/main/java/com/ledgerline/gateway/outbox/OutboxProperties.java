@@ -10,8 +10,9 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * @param topic        Kafka topic the events go to
  * @param partitions   partitions of {@code topic} when the app creates it
  * @param replicas     replication factor of {@code topic} when the app creates it
+ * @param lagRefresh   how often the outbox lag gauges are recomputed
  */
 @ConfigurationProperties("gateway.outbox")
 public record OutboxProperties(boolean relayEnabled, Duration interval, int batchSize, String topic,
-                               int partitions, short replicas) {
+                               int partitions, short replicas, Duration lagRefresh) {
 }

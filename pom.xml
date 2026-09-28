@@ -31,6 +31,7 @@
         <testcontainers.version>1.21.3</testcontainers.version>
         <springdoc.version>2.6.0</springdoc.version>
         <wiremock.version>3.9.2</wiremock.version>
+        <logstash-logback-encoder.version>8.0</logstash-logback-encoder.version>
     </properties>
 
     <dependencyManagement>
@@ -45,10 +46,15 @@
                 <artifactId>wiremock-standalone</artifactId>
                 <version>${wiremock.version}</version>
             </dependency>
+            <dependency>
+                <groupId>net.logstash.logback</groupId>
+                <artifactId>logstash-logback-encoder</artifactId>
+                <version>${logstash-logback-encoder.version}</version>
+            </dependency>
         </dependencies>
     </dependencyManagement>
 
-    <!-- Common to every app: web server, health + Prometheus metrics, test support. -->
+    <!-- Common to every app: web server, health + Prometheus metrics, trace ids, JSON logs, test support. -->
     <dependencies>
         <dependency>
             <groupId>org.springframework.boot</groupId>
@@ -61,6 +67,15 @@
         <dependency>
             <groupId>io.micrometer</groupId>
             <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+        <!-- traceId/spanId in the MDC and W3C traceparent on outgoing HTTP calls. No exporter: ids only. -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-tracing-bridge-otel</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>net.logstash.logback</groupId>
+            <artifactId>logstash-logback-encoder</artifactId>
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>

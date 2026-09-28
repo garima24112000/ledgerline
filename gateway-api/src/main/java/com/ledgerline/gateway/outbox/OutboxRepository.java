@@ -58,6 +58,21 @@ public class OutboxRepository {
         }
     }
 
+    /**
+     * How far the relay is behind: unpublished rows, and the age of the oldest one (0 when there are none).
+     * Reads only the partial index {@code outbox_events_unpublished_idx}, so it stays cheap however many
+     * events were published.
+     */
+    public OutboxLag lag() {
+        return jdbc.sql("""
+                        SELECT count(*) AS unpublished,
+                               COALESCE(EXTRACT(EPOCH FROM now() - min(created_at)), 0) AS oldest_age_seconds
+                        FROM outbox_events
+                        WHERE published_at IS NULL""")
+                .query((rs, row) -> new OutboxLag(rs.getLong("unpublished"), rs.getDouble("oldest_age_seconds")))
+                .single();
+    }
+
     public void incrementAttempts(Collection<UUID> ids) {
         if (!ids.isEmpty()) {
             jdbc.sql("UPDATE outbox_events SET attempts = attempts + 1 WHERE id IN (:ids)").param("ids", ids).update();

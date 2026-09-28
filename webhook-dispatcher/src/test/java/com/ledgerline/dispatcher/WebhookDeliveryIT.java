@@ -58,9 +58,13 @@ class WebhookDeliveryIT extends AbstractDispatcherIT {
         long merchant = merchantWithWebhook("whsec_" + UUID.randomUUID());
         stubMerchant(merchant, 500);
         double retriesBefore = meterRegistry.counter("webhook.retry").count();
+        double deadLetteredBefore = meterRegistry.counter("webhook.dead.lettered").count();
         String eventId = publish(merchant);
 
         await().atMost(Duration.ofSeconds(30)).until(() -> dltContains(eventId));
+        // The DLT handler consumes the letter after it lands on the topic, so wait for it too.
+        await().atMost(Duration.ofSeconds(10))
+                .until(() -> meterRegistry.counter("webhook.dead.lettered").count() > deadLetteredBefore);
 
         List<LoggedRequest> calls = webhookCalls(merchant);
         assertThat(calls).hasSize(3); // max-attempts: the original + 2 retries
@@ -74,7 +78,7 @@ class WebhookDeliveryIT extends AbstractDispatcherIT {
         deadLetterQueue.refreshSize();
         assertThat(deadLetterQueue.size()).isGreaterThanOrEqualTo(1);
         String metrics = rest.getForObject("/actuator/prometheus", String.class);
-        assertThat(metrics).contains("webhook_delivery_total{", "webhook_retry_total", "dlq_size");
+        assertThat(metrics).contains("webhook_delivery_total{", "webhook_retry_total", "webhook_dead_lettered_total", "dlq_size");
     }
 
     @Test
@@ -100,9 +104,13 @@ class WebhookDeliveryIT extends AbstractDispatcherIT {
         wiremock.stubFor(get(urlEqualTo("/internal/merchants/" + merchant + "/webhook-config"))
                 .willReturn(aResponse().withStatus(404)));
         double retriesBefore = meterRegistry.counter("webhook.retry").count();
+        double deadLetteredBefore = meterRegistry.counter("webhook.dead.lettered").count();
         String eventId = publish(merchant);
 
         await().atMost(Duration.ofSeconds(30)).until(() -> dltContains(eventId));
+        // The DLT handler consumes the letter after it lands on the topic, so wait for it too.
+        await().atMost(Duration.ofSeconds(10))
+                .until(() -> meterRegistry.counter("webhook.dead.lettered").count() > deadLetteredBefore);
 
         assertThat(meterRegistry.counter("webhook.retry").count()).isEqualTo(retriesBefore);
     }

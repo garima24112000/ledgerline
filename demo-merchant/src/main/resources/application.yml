@@ -33,3 +33,9 @@ management:
   metrics:
     tags:
       application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        "[http.server.requests]": true # buckets, so Grafana can aggregate p50/p95/p99 across instances
+  tracing:
+    sampling:
+      probability: 1.0 # no exporter is configured; tracing only supplies traceId/spanId for logs and propagation

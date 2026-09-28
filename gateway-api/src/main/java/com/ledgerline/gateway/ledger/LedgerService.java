@@ -3,6 +3,8 @@ package com.ledgerline.gateway.ledger;
 import static com.ledgerline.gateway.ledger.PostingRequest.credit;
 import static com.ledgerline.gateway.ledger.PostingRequest.debit;
 
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -17,10 +19,13 @@ public class LedgerService {
 
     private final AccountRepository accountRepository;
     private final LedgerRepository ledgerRepository;
+    private final MeterRegistry meterRegistry;
 
-    public LedgerService(AccountRepository accountRepository, LedgerRepository ledgerRepository) {
+    public LedgerService(AccountRepository accountRepository, LedgerRepository ledgerRepository,
+                         MeterRegistry meterRegistry) {
         this.accountRepository = accountRepository;
         this.ledgerRepository = ledgerRepository;
+        this.meterRegistry = meterRegistry;
     }
 
     /**
@@ -88,10 +93,26 @@ public class LedgerService {
      * Postgres checks at commit that the entry balances, and rejects any balance that would go
      * negative on an account that doesn't allow it; either failure rolls everything back.
      *
+     * <p>Timed as {@code ledger_post_seconds{entry_type}}. The timer covers the locks and inserts, not
+     * the commit (where the deferred balance check runs), because the transaction is owned by the caller.
+     *
      * @return the id of the new journal entry
      */
     @Transactional
     public long post(JournalEntryRequest entry) {
+        Timer.Sample sample = Timer.start(meterRegistry);
+        try {
+            return write(entry);
+        } finally {
+            sample.stop(Timer.builder("ledger.post")
+                    .description("Writing one journal entry: account locks, entry, postings, balances")
+                    .tag("entry_type", entry.type().name())
+                    .publishPercentileHistogram()
+                    .register(meterRegistry));
+        }
+    }
+
+    private long write(JournalEntryRequest entry) {
         // Net change per account. A TreeMap keeps the ids sorted, which gives the lock order.
         Map<Long, Long> deltaByAccount = new TreeMap<>();
         for (PostingRequest posting : entry.postings()) {

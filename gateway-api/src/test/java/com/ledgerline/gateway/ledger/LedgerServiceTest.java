@@ -15,6 +15,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -23,7 +24,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
-import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.test.util.ReflectionTestUtils;
@@ -45,11 +45,12 @@ class LedgerServiceTest {
     @Mock
     private LedgerRepository ledgerRepository;
 
-    @InjectMocks
+    private final SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
     private LedgerService ledgerService;
 
     @BeforeEach
     void setUp() {
+        ledgerService = new LedgerService(accountRepository, ledgerRepository, meterRegistry);
         lenient().when(accountRepository.findByOwnerTypeAndOwnerIdIsNullAndType(OwnerType.PLATFORM, AccountType.CUSTOMER_FUNDS))
                 .thenReturn(Optional.of(accountWithId(CUSTOMER_FUNDS)));
         lenient().when(accountRepository.findByOwnerTypeAndOwnerIdIsNullAndType(OwnerType.PLATFORM, AccountType.PLATFORM_FEES))
@@ -72,6 +73,13 @@ class LedgerServiceTest {
                 credit(PLATFORM_FEES, 200));
         assertThat(postedEntry().type()).isEqualTo(EntryType.CAPTURE);
         assertThat(postedEntry().paymentId()).isEqualTo(paymentId);
+    }
+
+    @Test
+    void postIsTimedByEntryType() {
+        ledgerService.capture(paymentId, MERCHANT_ID, 10_000);
+
+        assertThat(meterRegistry.get("ledger.post").tag("entry_type", "CAPTURE").timer().count()).isEqualTo(1);
     }
 
     @Test

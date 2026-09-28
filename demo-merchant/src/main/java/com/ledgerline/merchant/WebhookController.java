@@ -15,6 +15,7 @@ import java.time.Instant;
 import java.util.concurrent.ThreadLocalRandom;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -62,6 +63,15 @@ public class WebhookController {
             @Parameter(description = "t=<unix seconds>,v1=<hex HMAC-SHA256 of \"<t>.<body>\">")
             @RequestHeader(value = "X-Ledgerline-Signature", required = false) String signature,
             @RequestHeader(value = "X-Ledgerline-Event-Id", required = false) String eventIdHeader) {
+        try {
+            return handle(body, signature, eventIdHeader);
+        } finally {
+            MDC.remove("eventId");
+            MDC.remove("paymentId");
+        }
+    }
+
+    private ResponseEntity<Ack> handle(String body, String signature, String eventIdHeader) {
         JsonNode event;
         try {
             event = objectMapper.readTree(body);
@@ -73,6 +83,7 @@ public class WebhookController {
         if (eventId == null || (eventIdHeader != null && !eventIdHeader.equals(eventId))) {
             return answer(HttpStatus.BAD_REQUEST, "rejected");
         }
+        MDC.put("eventId", eventId);
 
         // merchantId from the (still unverified) body only picks which key to check with:
         // without that merchant's secret, nobody can produce a signature that passes.
@@ -81,6 +92,12 @@ public class WebhookController {
                 || !SignatureVerifier.isValid(signature, body, secret, Instant.now(), properties.signatureTolerance())) {
             log.warn("Rejected webhook {} with an invalid signature", eventId);
             return answer(HttpStatus.UNAUTHORIZED, "rejected");
+        }
+        // Only now: an unverified body could put any id in our logs. Refund events name it paymentId.
+        JsonNode data = event.path("data");
+        String paymentId = data.hasNonNull("paymentId") ? data.get("paymentId").asText() : data.path("id").asText(null);
+        if (paymentId != null) {
+            MDC.put("paymentId", paymentId);
         }
 
         // Before recording the event as processed, so the retry is processed for real.

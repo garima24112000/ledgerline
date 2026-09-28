@@ -89,7 +89,7 @@ class OutboxRelayIT extends AbstractGatewayIT {
         for (int i = 0; i < 300; i++) {
             inserted.add(insertOutboxRow(merchantId));
         }
-        OutboxProperties smallBatches = new OutboxProperties(true, Duration.ofMillis(200), 10, TOPIC, 6, (short) 1);
+        OutboxProperties smallBatches = new OutboxProperties(true, Duration.ofMillis(200), 10, TOPIC, 6, (short) 1, Duration.ofSeconds(5));
         OutboxRelay relayA = new OutboxRelay(repository, kafkaTemplate, transactionTemplate, objectMapper, smallBatches);
         OutboxRelay relayB = new OutboxRelay(repository, kafkaTemplate, transactionTemplate, objectMapper, smallBatches);
 

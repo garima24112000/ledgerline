@@ -48,7 +48,7 @@ class OutboxRelayTest {
         when(transactionTemplate.execute(any())).thenAnswer(call ->
                 call.<TransactionCallback<?>>getArgument(0).doInTransaction(null));
         relay = new OutboxRelay(repository, kafkaTemplate, transactionTemplate, objectMapper,
-                new OutboxProperties(true, Duration.ofMillis(200), 100, TOPIC, 6, (short) 1));
+                new OutboxProperties(true, Duration.ofMillis(200), 100, TOPIC, 6, (short) 1, Duration.ofSeconds(5)));
     }
 
     @Test

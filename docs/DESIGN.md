@@ -90,7 +90,9 @@ Swagger UI at `/swagger-ui.html`.
   installed Postgres (common on dev laptops). Containers still use `postgres:5432`. gateway-api
   defaults to `localhost:5433`, overridable with `DB_URL` / `DB_USERNAME` / `DB_PASSWORD`.
 - All services have healthchecks, and `make up` uses `docker compose up --wait`, so it returns only
-  once Postgres, Redis and Kafka are ready.
+  once Postgres, Redis, Kafka, Prometheus and Grafana are ready.
+- **Prometheus and Grafana run in compose, but the apps don't.** They run on the host (`make run-all`), so
+  Prometheus scrapes `host.docker.internal:8080–8083`. See [Observability](#observability).
 
 ### Security
 See [Security](#security-1) under Payments.
@@ -1392,6 +1394,7 @@ reason about, and is enough for a demo.
 |---|---|
 | `webhook_delivery_total{result}` | `success`, `http_error` (non-2xx), `timeout`, `connection_error`, `bulkhead_rejected` |
 | `webhook_retry_total` | deliveries attempted from a retry topic |
+| `webhook_dead_lettered_total` | events that reached the DLT (counted by the `@DltHandler`) |
 | `dlq_size` | dead letters not replayed yet |
 
 `dlq_size` is the sum of (DLT end offset − replay group's committed offset). It is recomputed every
@@ -1675,3 +1678,152 @@ is what serialises it. Options, not built yet:
   so excess load gets a quick 503 instead of queueing for seconds.
 - `duplicate_storm` is barely affected: 6000 requests, but only 620 did real work. Duplicates are
   cheap (a no-op `INSERT` plus a `SELECT`, no bank call, no ledger lock).
+
+## Observability
+
+Three things answer "is the payment path healthy, and what happened to payment X?": latency
+histograms, a Prometheus + Grafana stack with a provisioned dashboard, and JSON logs with correlation
+ids in the MDC.
+
+### Metrics added
+
+| Metric | Type | Tags | Where |
+|---|---|---|---|
+| `payment_create_seconds` | timer + histogram | `outcome`: `captured`, `failed`, `unknown`, `replayed`, `rejected` | `PaymentService.create` |
+| `bank_call_seconds` | timer + histogram | `operation` (`charge`/`lookup`), `outcome` (`approved`, `declined`, `not_found`, `unavailable`) | `BankClient` |
+| `ledger_post_seconds` | timer + histogram | `entry_type` (`CAPTURE`/`REFUND`) | `LedgerService.post` |
+| `http_server_requests_seconds` | Boot's timer, histogram switched on | `uri`, `method`, `status`, … | every app |
+| `outbox_unpublished_events` | gauge | none | `OutboxMetrics` |
+| `outbox_oldest_unpublished_age_seconds` | gauge | none | `OutboxMetrics` |
+| `webhook_dead_lettered_total` | counter | none | `PaymentEventListener.onDeadLetter` |
+
+These are reused as they were: `rate_limited_requests_total{tier}`, `webhook_delivery_total{result}`,
+`webhook_retry_total`, `dlq_size`, JVM and `hikaricp_*`. Every metric carries
+`application=<spring.application.name>`.
+
+- **Histograms, not client-side percentiles.** `publishPercentileHistogram()` exports `_bucket`
+  series, and Grafana computes p50/p95/p99 with
+  `histogram_quantile(q, sum by (le) (rate(..._bucket[$__rate_interval])))`. Percentiles computed
+  inside each JVM (`.publishPercentiles(0.99)`) can't be combined: the average of two pods' p99s is
+  not the p99. Buckets can be summed across pods first. The cost is about 70 series per timer and
+  tag combination, which is fine at this cardinality.
+- **The `outcome` tag is decided in a `finally`,** so a timer that throws still records. `rejected`
+  is an `ApiException` (409/422). Anything else is `error`.
+- **`ledger_post_seconds` excludes the commit.** The transaction belongs to the caller
+  (`PaymentTransitions`), and the deferred balance trigger runs at COMMIT. The timer covers the lock
+  wait, the inserts and the balance updates. The load-test knee (two hot account rows) shows up
+  here as lock wait.
+- **No id labels.** `paymentId`, `merchantId` and `eventId` go in logs, not in metric tags; one
+  series per payment would sink Prometheus. `rate_limited_requests_total{merchant}` is the one
+  exception already discussed under [Rate limiting](#rate-limiting).
+
+### Outbox lag
+`OutboxMetrics` runs one query every 5 s (`gateway.outbox.lag-refresh`) and caches the result in an
+`AtomicReference` that the two gauges read:
+
+```sql
+SELECT count(*), COALESCE(EXTRACT(EPOCH FROM now() - min(created_at)), 0)
+FROM outbox_events WHERE published_at IS NULL
+```
+
+- **Scheduled, not per scrape.** It's the same reasoning as `dlq_size`: a slow database must not
+  stall `/actuator/prometheus`. If the query fails, the last value is kept and a warning is logged.
+- **Every replica reports the same number,** so the dashboard uses `max()`, not `sum()`.
+- **The age matters more than the count.** A burst makes the count jump for a moment. An age that
+  keeps growing means the relay is stuck (Kafka down, or a row that never publishes).
+
+`make explain-outbox` now measures this query as well (1M published and 1,000 unpublished rows
+seeded, plus about 390k rows already in my local database from the k6 runs):
+
+```
+-- WITH outbox_events_unpublished_idx
+Aggregate (actual time=1.126..1.126 rows=1 loops=1)
+  Buffers: shared hit=954
+  ->  Index Only Scan using outbox_events_unpublished_idx on outbox_events (rows=1000)
+        Heap Fetches: 1000
+Execution Time: 1.149 ms
+
+-- WITHOUT it
+Finalize Aggregate (actual time=37.676..39.930 rows=1 loops=1)
+  Buffers: shared hit=15210 read=22476
+  ->  Gather (Workers Launched: 2)
+        ->  Parallel Seq Scan on outbox_events (rows=333 loops=3)
+              Filter: (published_at IS NULL)
+              Rows Removed by Filter: 463810
+Execution Time: 39.944 ms
+```
+
+`count(*)` and `min(created_at)` both come from the relay's partial index, which holds only the
+backlog. The 1,000 heap fetches happen because the seeded rows aren't in the visibility map yet
+(same transaction, no VACUUM). On a vacuumed table most of them go away.
+
+### Dashboard and scraping
+`infra/grafana/ledgerline-dashboard.json` has the `uid` `ledgerline` and an `$application` filter.
+It is provisioned read-only (`allowUiUpdates: false`), so the file in git is the source of truth.
+The datasource has a fixed uid (`prometheus`) that the dashboard refers to.
+
+| Panel | Query (simplified) |
+|---|---|
+| Request rate | `sum by (application, method, uri) (rate(http_server_requests_seconds_count{uri!~"/actuator.*"}))` |
+| 4xx / 5xx | same, `status=~"4.."` / `"5.."`, by application |
+| POST /v1/payments p50/p95/p99 | `histogram_quantile(q, sum by (le) (rate(http_server_requests_seconds_bucket{uri="/v1/payments",method="POST"})))` |
+| payment.create / bank / ledger p50/p95/p99 | same, over `payment_create_seconds`, `bank_call_seconds{operation="charge"}`, `ledger_post_seconds` |
+| 429 per tier | `sum by (tier) (rate(rate_limited_requests_total))` |
+| Outbox lag | `max(outbox_unpublished_events)`, `max(outbox_oldest_unpublished_age_seconds)` |
+| Webhooks | `sum by (result) (rate(webhook_delivery_total))`, `increase(webhook_retry_total)`, `increase(webhook_dead_lettered_total)`, `max(dlq_size)` |
+| JVM heap | `sum by (application) (jvm_memory_used_bytes{area="heap"})` vs max |
+| Hikari | `hikaricp_connections_active/idle/pending/max` (gateway-api) |
+
+- **Images are pinned** (`prom/prometheus:v3.5.0`, `grafana/grafana:11.6.0`), so the dashboard JSON
+  and the PromQL behave the same on every machine.
+- **Scrape interval 5 s,** which Grafana is told as the datasource's `timeInterval`, so
+  `$__rate_interval` is never shorter than 4 scrapes.
+- `host.docker.internal` is built into Docker Desktop; `extra_hosts: host-gateway` makes the same
+  name work on Linux.
+
+### Logs: JSON with correlation ids
+Each app has the same `logback-spring.xml`: `LogstashEncoder` on stdout, so every line is one JSON
+object (`@timestamp`, `level`, `logger_name`, `message`, `stack_trace`, `app`, and every MDC key). The
+`plain-logs` profile switches back to Boot's text format for reading by eye. The four copies are
+duplicated on purpose. The modules share no resources module, and adding one for a 20-line file
+isn't worth it.
+
+What goes in the MDC:
+
+| Key | Set by | Scope |
+|---|---|---|
+| `traceId`, `spanId` | Micrometer Tracing (OTel bridge, no exporter) | each HTTP request |
+| `paymentId` | gateway `PaymentService.create` / `refund`, `PaymentReconciler`; mock-bank `ChargeController`; demo-merchant after the signature is verified | that payment's work |
+| `eventId`, `eventType`, `merchantId`, `paymentId` | dispatcher `EventLogContext`, around each record and dead letter | one Kafka record |
+
+- **`MDC.putCloseable` in try-with-resources,** so the key is removed even when the block throws.
+  The MDC is thread-local. That is safe with virtual threads because a request or a record is
+  handled start to finish on one virtual thread. It would *not* follow work handed to another
+  executor, and nothing here does that.
+- **Where the trace reaches, and where it stops.** Boot's `RestClient.Builder` is instrumented, so
+  the gateway's call to mock-bank carries a W3C `traceparent`, and mock-bank's log line for that
+  charge has the gateway's `traceId`. `StructuredLoggingIT` checks this: the WARN line for a bank
+  timeout is JSON with the right `paymentId` and a `traceId` equal to the one in the `traceparent`
+  header WireMock received. The trace **stops at the outbox**: the event is published later, by the
+  relay, outside the request. The dispatcher and demo-merchant therefore correlate by
+  `paymentId`/`eventId`, which the event body always carries. Scheduled jobs are not assumed to have
+  a `traceId`; nothing tests that.
+- **Carrying the trace through the outbox (not built):** add a `traceparent` column to
+  `outbox_events` (V6), fill it from the current span in `OutboxService.append`, send it as a Kafka
+  header from the relay, and turn on `spring.kafka.listener.observation-enabled` in the dispatcher.
+  The dispatcher's spans would then join the original request's trace. It is left out because ids in
+  the MDC already answer "what happened to payment X", and there is no trace backend to view spans in.
+- **Sampling is 1.0** but nothing is exported, so it costs nothing. It only sets the sampled flag
+  in `traceparent`.
+
+### Testing
+- Unit: `OutboxMetricsTest` (gauges start at 0, refresh publishes, a failed refresh keeps the last
+  value); `PaymentServiceTest` (`payment.create` recorded as `captured`, `unknown`, `rejected`);
+  `LedgerServiceTest` (`ledger.post{entry_type=CAPTURE}`); `WebhookEventTest` (paymentId from
+  payment and refund events; `EventLogContext` sets the MDC and clears it on close).
+- Integration: `MetricsIT` (after a real payment, `/actuator/prometheus` has `_bucket` series for
+  `payment_create`, `ledger_post`, `bank_call` and `http_server_requests`, plus `hikaricp_*`; a
+  2-minute-old unpublished row makes the age gauge ≥ 120 s); `StructuredLoggingIT` (above);
+  `WebhookDeliveryIT` (a dead-lettered event increments `webhook_dead_lettered_total`).
+- Checked by hand: `promtool check config` passes; with `make up`, all 4 Prometheus targets are
+  UP and Grafana lists the provisioned dashboard and datasource.

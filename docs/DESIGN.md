@@ -907,7 +907,8 @@ has no safe ordering:
   a capture that never happened.
 
 The database and Kafka can't share one transaction. So the event is written to the **database**,
-in the same transaction as the change, and a separate relay moves it to Kafka afterwards.
+in the same transaction as the change, and a separate relay moves it to Kafka afterwards. See
+[What is the dual-write problem?](#what-is-the-dual-write-problem) for the full argument.
 
 ### Writing events
 | State change | Where | Event |
@@ -941,15 +942,12 @@ in the same transaction as the change, and a separate relay moves it to Kafka af
 2. Send every row to `payment.events`, keyed by merchant id, then wait for **every** ack.
 3. `published_at = now()` for the acked rows, `attempts + 1` for the failed ones, then commit.
 
-**Why it is safe with many replicas:** `FOR UPDATE` locks the batch, and `SKIP LOCKED` makes another
-relay pass over locked rows instead of waiting. Two relays therefore get disjoint batches. By the
-time relay A releases its locks (commit), its rows are published, and nobody selects them again.
-`OutboxRelayIT` proves this with two relay instances draining 300 rows at once, in batches of 10.
+**Safe with many replicas:** `SKIP LOCKED` gives concurrent relays disjoint batches. See
+[Why does SKIP LOCKED make the relay horizontally scalable?](#why-does-skip-locked-make-the-relay-horizontally-scalable).
 
-**Delivery is at-least-once, not exactly-once.** If Kafka acks and the DB commit then fails (crash,
-connection lost), the rows stay unpublished and go out again. That's why every event carries an
-id, and merchants must dedupe. Exactly-once from Postgres to an HTTP endpoint isn't possible;
-at-least-once plus idempotent consumers is the standard answer.
+**At-least-once:** an event can reach Kafka, and the merchant, more than once. See
+[Why at-least-once, not exactly-once?](#why-at-least-once-not-exactly-once) and
+[Why must the merchant dedupe by event id?](#why-must-the-merchant-dedupe-by-event-id).
 
 **Trade-off: locks are held while waiting for Kafka.** Elsewhere this codebase never holds a lock
 across a network call (see `PaymentTransitions`). Here it's deliberate, for three reasons:
@@ -971,10 +969,9 @@ mark published in another. It holds no lock, but it adds a column, a timeout to 
 **Throughput:** one batch per tick gives at most about 500 events/s per replica. That's plenty
 here, and draining in a loop while batches come back full is a two-line change.
 
-**Ordering:** events are keyed by merchant id, so one merchant's events land on one partition in
-`created_at` order. Webhook delivery doesn't preserve that order anyway, because retry topics let a
-later event overtake a failing one. So merchants should treat each event as a standalone fact, and
-`data.status` / `updatedAt` tell them the latest state.
+**Ordering:** events are keyed by merchant id, so one merchant's events share a partition. That
+does **not** mean merchants receive them in order; see
+[How do partition keys give per-merchant ordering, and where is it lost?](#how-do-partition-keys-give-per-merchant-ordering-and-where-is-it-lost).
 
 ### EXPLAIN ANALYZE: the relay query
 The relay runs 5 times a second per replica. Almost every row in the table is published, and
@@ -1004,6 +1001,125 @@ The index scan is about 500× faster and reads 105 buffers instead of about 17,0
 holds only unpublished rows, so it stays a few pages however large the table grows. A row leaves
 it when `published_at` is set. The dispatcher's merchant lookup
 (`GET /internal/merchants/{id}/webhook-config`) is a primary-key lookup, and it is cached.
+
+### Why it's built this way (interview notes)
+
+#### What is the dual-write problem?
+Capturing a payment has to change two systems: the payment row (and ledger) in Postgres, and an
+event in Kafka. Nothing makes those two writes atomic, so every ordering has a crash window:
+
+| Order | Crash window | Result |
+|---|---|---|
+| Commit, then publish | after `COMMIT`, before `send()` succeeds (crash, deploy, Kafka down) | Payment CAPTURED, **event lost**. The merchant never ships the order. |
+| Publish, then commit | after the send, before `COMMIT` (constraint violation, deadlock, crash) | **Phantom event**: the merchant ships goods for a payment that rolled back. |
+
+"Retry the publish" doesn't close the first window: the process that would retry is the one that
+crashed, and the fact that it still had work to do was only in its memory.
+
+**Why not one transaction across both?** There isn't one available.
+- Kafka's transactions make a *set of Kafka writes* (plus consumer offsets) atomic. They can't
+  include a Postgres commit.
+- Kafka doesn't take part in XA / two-phase commit. Even where 2PC exists, it couples both systems'
+  availability and leaves in-doubt transactions to clean up after a coordinator crash.
+
+**What the outbox does instead.** It replaces two writes to two systems with:
+1. **One local transaction.** The payment change and an `outbox_events` row commit together, or
+   not at all. Postgres guarantees that on its own.
+2. **A copy step that can be retried forever.** The relay reads committed rows and publishes them.
+   If it crashes, the rows are still there, unpublished, and the next run picks them up.
+
+The event can no longer be lost (it is durable with the change) or phantom (it only exists if the
+change committed). The price is that it can now be sent *twice*, which the next two notes cover.
+
+**The alternative: change data capture (CDC).** Debezium can tail Postgres' write-ahead log and
+publish outbox inserts to Kafka, with no polling and lower latency. It's the better choice at scale.
+Here it would mean another service (Kafka Connect) and logical-replication setup to run and
+explain. The polling relay is about 100 lines, with the same guarantees for this load.
+
+#### Why does SKIP LOCKED make the relay horizontally scalable?
+Suppose two gateway replicas each run the relay against the same table. What happens depends on how
+the batch query locks rows:
+
+| Query | Replica B, while A holds 100 rows |
+|---|---|
+| plain `SELECT` (no lock) | reads the **same** 100 rows, so every event is published twice |
+| `FOR UPDATE` | **waits** for A to commit, then finds them published. Replicas take turns: adding one adds nothing |
+| `FOR UPDATE NOWAIT` | **errors** immediately, so B does no work |
+| `FOR UPDATE SKIP LOCKED` | **skips** A's rows and locks the next 100. Both work at once |
+
+A timeline with `SKIP LOCKED` and a backlog of 200 rows:
+```
+t0  A: lock rows 1-100           B: skip 1-100, lock rows 101-200
+t1  A: send, wait for acks        B: send, wait for acks
+t2  A: mark 1-100 published, COMMIT (locks released)
+t3                                B: mark 101-200 published, COMMIT
+t4  A and B: next batch -> nothing unpublished left
+```
+No row is in two batches, because a row is locked by at most one transaction. It can't be picked up
+again afterwards either, because it is published before its lock is released. That turns a table
+into a **work queue**: add replicas, and each takes its own share.
+`OutboxRelayIT.twoRelayInstancesNeverPublishTheSameRow` checks exactly this: 300 rows, two relay
+instances, batches of 10, disjoint results, and each event on the topic exactly once.
+
+Limits worth saying out loud:
+- **Postgres is still shared.** Replicas scale the *sending*; every batch still costs an indexed
+  query and an UPDATE on one database. At some point CDC or partitioning the outbox wins.
+- **Batches are only roughly in order.** `created_at` defaults to `now()`, which is the
+  transaction's *start* time. A long transaction can commit after a shorter one that started later,
+  so its row appears "earlier" than rows already published. Nothing is lost (the relay takes every
+  unpublished row), but order across batches is approximate. That matters for ordering, below.
+
+#### Why at-least-once, not exactly-once?
+Every hand-off in the pipeline can succeed on the far side while the near side doesn't learn it.
+When in doubt, the only safe move is to send again. These are the duplicate windows in *this* code:
+
+1. **Relay → Kafka.** Kafka acks the batch, then the relay's `COMMIT` fails (crash, DB failover).
+   The rows are still unpublished, so the next run sends them again.
+2. **Dispatcher → merchant.** The merchant processes the POST, but its 2xx is lost or arrives after
+   the 5 s hard timeout. The dispatcher counts a failure and the retry topic delivers it again.
+3. **Consumer offsets.** The dispatcher delivers a record, then crashes or loses its partitions in
+   a rebalance before its offset is committed. The next owner of the partition reprocesses it.
+4. **DLQ replay.** An operator replays a letter the merchant had in fact processed (case 2, on the
+   last attempt).
+
+Why not just turn exactly-once on?
+- **`enable.idempotence=true`** removes one kind of duplicate: the *producer's own* network
+  retries within one producer session. Kafka discards a retried batch by sequence number. It knows
+  nothing about case 1, where a *new* relay run sends the row again as a new record.
+- **Kafka exactly-once semantics (EOS)** make "read from Kafka, write to Kafka, commit offsets"
+  atomic. The side effect here is an **HTTP call to someone else's server**, which no Kafka
+  transaction can include or roll back.
+- **The general reason:** to deliver exactly once, the receiver would have to perform its side
+  effect *and* tell the sender, atomically. Over a network that can drop the reply, the sender
+  can't tell "done, reply lost" from "never arrived". (It's the two generals problem.) So it must
+  choose between maybe-never (at-most-once) and maybe-twice (at-least-once).
+
+For payments, a lost "payment captured" is far worse than a repeated one, so the design chooses
+at-least-once and makes duplicates harmless. That is the next note.
+
+#### Why must the merchant dedupe by event id?
+At-least-once delivery plus a receiver that ignores repeats gives **effectively-once processing**.
+The dispatcher can't do the ignoring for the merchant, because only the merchant knows what it has
+already processed. So it gives the merchant what it needs to do it:
+
+- **A stable id.** `outbox_events.id` is minted once, when the event is written, and every copy
+  carries it, whether that copy comes from a relay re-run, a retry topic, or a DLQ replay. (The
+  signature's `t` differs on every attempt, so the raw request is never byte-identical; the event
+  id is the thing to compare.)
+- **In a signed place.** `id` is inside the body, which the HMAC covers. `X-Ledgerline-Event-Id`
+  is a convenience copy for logging and quick lookups; demo-merchant rejects a mismatch.
+
+**Why not dedupe on payment id?** One payment produces several distinct events: `payment.captured`,
+then one `refund.created` per refund. Deduping on payment id would drop the refunds.
+
+**How a real merchant should do it.** Keep a `processed_events(event_id PRIMARY KEY)` table and insert
+into it **in the same database transaction** as the side effect (marking the order paid). A
+duplicate then fails the unique constraint: roll back and answer **2xx**, so the dispatcher stops
+retrying. Doing the side effect and recording the id separately recreates a small dual-write
+problem on the merchant's side.
+
+demo-merchant uses an in-memory Caffeine set instead. That's fine for a demo, but it forgets
+everything on restart and isn't shared between instances.
 
 ### Testing
 - **Unit (Mockito):**
@@ -1137,6 +1253,125 @@ Later starts took 1.8 s, and I couldn't reproduce it. The likely cause is the fi
 group creating `__consumer_offsets` while the virtual-thread consumers wait. If it shows up again,
 the next step is running the listener containers on platform threads, which a `ContainerCustomizer`
 can set. They are 15 long-lived pollers, so virtual threads buy nothing there.
+
+### Why it's built this way (interview notes)
+
+#### Virtual threads vs platform threads, and when does pinning hurt?
+**Platform threads** are OS threads. Each has a fixed stack reserved up front (about 1 MB by
+default), and the OS schedules them. They are too expensive to have tens of thousands of, so servers
+pool them: Tomcat defaults to 200. In thread-per-request code, that caps concurrency at 200
+requests, even when all 200 are just *waiting* on a database or a bank.
+
+**Virtual threads** (Java 21) are scheduled by the JVM. They run *mounted* on a small pool of
+carrier threads (about one per CPU core). When one blocks on I/O (a socket read, `Thread.sleep`, a
+lock), the JVM saves its small, growable stack to the heap and **unmounts** it, so the carrier runs
+another virtual thread. You write plain blocking code and get the concurrency of async code.
+
+Where this project uses them, and what they don't do:
+- **gateway-api requests** (`spring.threads.virtual.enabled`): a request waiting up to 2 s on the
+  bank doesn't hold one of 200 pooled threads.
+- **The dispatcher's webhook calls** (`WebhookHttpClient` runs the JDK `HttpClient` on a
+  virtual-thread executor): many slow merchants cost heap, not threads.
+- **They don't help CPU-bound work.** There are still only as many carriers as cores.
+- **They don't create database connections.** Ten thousand virtual threads still share Hikari's 10
+  connections. The pool, not the thread count, is the real limit. Virtual threads just wait in line
+  more cheaply.
+
+**Pinning** is when a virtual thread blocks but *can't* unmount, so it holds its carrier the whole
+time. On JDK 21 that happens when it blocks:
+- **inside a `synchronized` block or method** (for example `Object.wait()`, or I/O while holding a
+  monitor);
+- **inside a native frame** (JNI, some native library calls).
+
+A few pinned threads only cost throughput. It hurts when **every carrier is pinned at once**:
+runnable virtual threads, including the ones that would release what the pinned threads wait for,
+get no CPU. The result looks like a latency cliff or a deadlock under load, while CPU sits idle.
+
+- **Detect it:** `-Djdk.tracePinnedThreads=short` (JDK 21) prints a stack trace when a pinned
+  thread blocks. JFR records `jdk.VirtualThreadPinned` events.
+- **Avoid it:** use `ReentrantLock` instead of `synchronized` around blocking calls. Keep
+  long-lived blocking pollers on platform threads. Don't pool virtual threads, because they are
+  meant to be created per task. Be careful with `ThreadLocal` caches, which become per-task, not
+  per-thread.
+- **JDK 24 (JEP 491)** lets virtual threads unmount inside `synchronized`. Native frames still pin.
+
+Here, the Kafka listener containers also run on virtual threads (Spring Boot does that when
+virtual threads are enabled). They are 15 long-lived consumers blocked in `poll()`, so they gain
+nothing. They also carry the general pinning risk: a consumer that blocks while holding a monitor,
+or inside native code, stays pinned to its carrier. If many carriers are pinned at once, fewer
+are left for the virtual threads that deliver webhooks and serve requests. The unexplained slow
+first start in [Observed on a fresh broker](#observed-on-a-fresh-broker) *may* be pinning, but that
+isn't confirmed; a later start with pin tracing showed nothing.
+
+#### Why is a per-merchant semaphore a bulkhead?
+A ship's hull is divided into watertight compartments (bulkheads), so a breach floods one
+compartment instead of sinking the ship. In software, a bulkhead **caps how much of a shared
+resource one tenant or dependency can hold**, so one failure can't drain everything.
+
+Here the shared resource is the dispatcher's delivery threads. Without a cap, one merchant whose
+endpoint hangs gets every thread that picks up its events stuck for 5 s each. Soon all threads are
+waiting on that merchant, and healthy merchants' webhooks queue behind it.
+
+`MerchantBulkhead` gives each merchant its own `Semaphore(10)`:
+- **`tryAcquire()`, never `acquire()`.** A blocking `acquire` would park the consumer thread until a
+  permit freed up. That is the thread starvation the bulkhead exists to prevent, just moved.
+  Instead, a full bulkhead throws `BulkheadFullException`, the event goes to a retry topic, and the
+  thread moves on to the next record, likely another merchant's.
+- **`release()` in a `finally`.** Every path, including timeouts and exceptions, gives the permit
+  back. A leaked permit would slowly shrink the merchant's capacity to zero.
+- **Per instance, not global.** Three dispatcher replicas allow up to 30 calls in flight for one
+  merchant. A global limit would need shared state (Redis), which is more moving parts than this
+  needs.
+- **`computeIfAbsent`** creates each merchant's semaphore atomically on first use, so two threads
+  can't create two semaphores for one merchant.
+
+How it differs from its neighbours:
+
+| Tool | Limits | Question it answers |
+|---|---|---|
+| Bulkhead | **concurrency**: calls in flight at once | "How many threads may this merchant hold?" |
+| Rate limiter | **rate**: calls per second | "How often may this merchant be called?" |
+| Timeout | **duration** of one call | "How long may one call hold a thread?" |
+| Circuit breaker | calls after **repeated failures** | "Should we stop calling for a while?" |
+
+They combine: the 5 s timeout bounds how long a permit is held, and the bulkhead bounds how many are
+held. Resilience4j's `Bulkhead` is the library version of the same idea. See
+[Concurrency and the bulkhead](#concurrency-and-the-bulkhead) for why a cap of 10 out of 15 threads
+still leaves room for everyone else.
+
+#### How do partition keys give per-merchant ordering, and where is it lost?
+**What Kafka guarantees:**
+- A topic is split into partitions, and each partition is an **append-only, ordered log**.
+- A record with a key goes to partition `murmur2(key) % partitionCount`. The relay uses the merchant
+  id as the key, so all of one merchant's events land on **the same partition**, in the order they
+  were written.
+- In a consumer group, each partition is read by **exactly one consumer at a time**, from the
+  lowest offset up. So one merchant's events are also *processed* in log order, while other
+  merchants' partitions are processed in parallel. The key buys both ordering and parallelism.
+- The idempotent producer keeps this true across its own retries: with up to 5 requests in flight,
+  a retried batch can't land behind a later one.
+
+**Where this design loses the order.** It is honest to say ordering is only guaranteed *within the
+partition log*, not end to end:
+1. **Several relays.** With two relays, a merchant's event N can be in relay A's batch and N+1 in
+   relay B's. They send concurrently, so N+1 can be written first. With one relay, order follows
+   `created_at`, which is itself only roughly commit order (see
+   [SKIP LOCKED](#why-does-skip-locked-make-the-relay-horizontally-scalable)).
+2. **Retry topics.** If event N fails, it moves to a retry topic and waits 10 s. Event N+1 is
+   delivered meanwhile. That is the point of non-blocking retries: one bad event must not block its
+   partition.
+3. **DLQ replay.** A replayed event arrives long after the events that followed it.
+4. **Changing the partition count** changes `% partitionCount`, so a merchant's new events can go to
+   a different partition than its old, unconsumed ones.
+
+A related risk: one very large merchant makes its partition **hot**, since only one consumer can
+work on it. Keying by payment id would spread the load, but it gives up even per-merchant
+partition order.
+
+**Consequence for merchants:** treat every event as a standalone fact, not a step in a sequence. If
+a `refund.created` arrives before `payment.captured`, the event's `data` (`status`, `refundedAmount`,
+`updatedAt`) says what's true; `GET /v1/payments/{id}` is the source of truth. Strict ordering would
+need blocking retries per merchant, head-of-line blocking included, which is the opposite trade-off.
 
 ### Testing
 - **Unit (Mockito):**

@@ -2226,7 +2226,8 @@ Redis and Kafka as StatefulSets. Reasons:
   - **Secrets Manager:** $0.40 per secret per month, and nothing it offers is needed here.
 
 ### GitHub OIDC: main branch of this repository only
-Trust policy: `aud = sts.amazonaws.com` **and** `sub = repo:garima24112000/ledgerline:ref:refs/heads/main`,
+Trust policy: `aud = sts.amazonaws.com` **and**
+`sub = repo:garima24112000@76704188/ledgerline@1391413618:ref:refs/heads/main`,
 both `StringEquals` with no wildcards.
 - PRs, other branches, tags and forks cannot assume the role, and neither can a job using a GitHub
   `environment:` (its `sub` becomes `…:environment:<name>`). deploy.yml deliberately has no

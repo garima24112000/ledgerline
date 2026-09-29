@@ -33,6 +33,33 @@ variable "github_repository" {
   default     = "garima24112000/ledgerline"
 }
 
+# GitHub now issues immutable OIDC subjects (repositories created after 2026-07-15, or opted in):
+#   repo:<owner>@<owner-id>/<repo>@<repo-id>:ref:refs/heads/<branch>
+# The numeric ids survive renames and can't be reused by someone who later takes the same name.
+# Read them from the deploy workflow's "OIDC claims" job (repository_owner_id, repository_id), or:
+#   gh api repos/<owner>/<repo> --jq '.owner.id, .id'
+variable "github_owner_id" {
+  description = "Numeric id of the repository owner (OIDC claim repository_owner_id)."
+  type        = string
+  default     = "76704188"
+
+  validation {
+    condition     = can(regex("^[0-9]+$", var.github_owner_id))
+    error_message = "github_owner_id must be the numeric owner id, e.g. 76704188."
+  }
+}
+
+variable "github_repository_id" {
+  description = "Numeric id of the repository (OIDC claim repository_id)."
+  type        = string
+  default     = "1391413618"
+
+  validation {
+    condition     = can(regex("^[0-9]+$", var.github_repository_id))
+    error_message = "github_repository_id must be the numeric repository id, e.g. 1391413618."
+  }
+}
+
 variable "github_branch" {
   description = "The only branch whose workflows may assume the deploy role."
   type        = string

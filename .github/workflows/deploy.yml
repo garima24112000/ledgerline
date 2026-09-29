@@ -2,7 +2,8 @@
 # Lambda code, then `helm upgrade --install` with values-eks.yaml.
 #
 # AWS access is GitHub OIDC -> the ledgerline-github-deploy role (infra/terraform/github-oidc.tf),
-# whose trust policy accepts only repo:<this repo>:ref:refs/heads/main. So:
+# whose trust policy accepts only this repository's main branch, as GitHub's immutable subject
+# repo:<owner>@<owner-id>/<repo>@<repo-id>:ref:refs/heads/main. So:
 #   - no stored AWS keys;
 #   - workflow_dispatch from any other branch fails at "Configure AWS credentials";
 #   - no GitHub `environment:` here (it would change the token's sub claim and break the trust).
@@ -35,7 +36,8 @@ jobs:
     uses: ./.github/workflows/ci.yml
 
   # TEMPORARY diagnostic: print the OIDC claims GitHub actually issues, to compare with the deploy
-  # role's trust policy (sub = repo:<owner>/<repo>:ref:refs/heads/main). Remove once AssumeRole works.
+  # role's trust policy (sub = repo:<owner>@<owner-id>/<repo>@<repo-id>:ref:refs/heads/main). Remove once
+  # a deploy has assumed the role successfully.
   # Prints selected payload claims only: never the raw token, never AWS credentials. Makes no AWS call.
   oidc-claims:
     name: OIDC claims (temporary)

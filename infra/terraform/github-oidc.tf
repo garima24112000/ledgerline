@@ -17,11 +17,19 @@ data "aws_iam_openid_connect_provider" "github" {
 
 locals {
   github_oidc_provider_arn = var.create_github_oidc_provider ? aws_iam_openid_connect_provider.github[0].arn : data.aws_iam_openid_connect_provider.github[0].arn
+
+  # The exact subject GitHub issues for this repository (immutable format, see variables.tf):
+  #   repo:garima24112000@76704188/ledgerline@1391413618:ref:refs/heads/main
+  # The legacy form repo:<owner>/<repo>:ref:refs/heads/main is NOT what this repository's tokens carry,
+  # so a policy with it rejects every run ("Not authorized to perform sts:AssumeRoleWithWebIdentity").
+  github_owner        = split("/", var.github_repository)[0]
+  github_repo         = split("/", var.github_repository)[1]
+  github_oidc_subject = "repo:${local.github_owner}@${var.github_owner_id}/${local.github_repo}@${var.github_repository_id}:ref:refs/heads/${var.github_branch}"
 }
 
 # Exact match, no wildcards: only workflows running on refs/heads/main of this repository.
 # Pull requests, other branches, tags and GitHub "environments" (which change the sub claim to
-# repo:<repo>:environment:<name>) are all rejected.
+# ...:environment:<name>) are all rejected.
 data "aws_iam_policy_document" "github_trust" {
   statement {
     actions = ["sts:AssumeRoleWithWebIdentity"]
@@ -37,7 +45,7 @@ data "aws_iam_policy_document" "github_trust" {
     condition {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_repository}:ref:refs/heads/${var.github_branch}"]
+      values   = [local.github_oidc_subject]
     }
   }
 }

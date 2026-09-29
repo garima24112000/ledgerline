@@ -87,7 +87,9 @@ Docker is **not** needed for AWS: images are built on GitHub's amd64 runners.
 | `DEPLOY_ENABLED` | `true` while the stack exists; `aws-down.sh` sets `false` | — |
 
 There are no AWS secrets in GitHub. The deploy role trusts only
-`repo:garima24112000/ledgerline:ref:refs/heads/main`. Pull requests, other branches and GitHub
+`repo:garima24112000@76704188/ledgerline@1391413618:ref:refs/heads/main`: GitHub's immutable subject
+format, with the numeric owner and repository ids (`github_owner_id` / `github_repository_id` in
+Terraform). Pull requests, other branches and GitHub
 "environments" cannot assume it.
 
 ## 4. First deploy

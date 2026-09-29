@@ -202,6 +202,10 @@ Things to set on the cluster side:
   replicas does not raise a merchant's limit.
 - Watch the gateway's `/actuator/prometheus` while the test runs, especially
   `hikaricp_connections_pending` and `rate_limited_requests_total`.
+- On EKS with RDS, the first limit to show up was row locks in the database, not the load
+  generator or the pods ([results/aws-diagnostic-steady-50.md](results/aws-diagnostic-steady-50.md)).
+  To see what the sessions are waiting on, use
+  [RUNBOOK: Lock contention on the ledger](../../docs/RUNBOOK.md#8-lock-contention-on-the-ledger).
 
 ## What each scenario measures
 
@@ -340,6 +344,8 @@ key count while payments found still equals it. The payment count is what proves
 
 ## Results
 
+### Local benchmark (the capacity numbers)
+
 Final local measurements (MacBook, whole stack and k6 on one machine, two PRO merchants, mock-bank
 without timeouts):
 
@@ -365,3 +371,19 @@ Where new runs go:
 - A single `k6 run` writes to `results/latest/`, which is gitignored.
 
 When a run is worth keeping, copy its `.md` into `results/` and add what it shows.
+
+### AWS diagnostic run (not a benchmark)
+
+One run on EKS (us-east-1, 3 × c7i-flex.large, RDS PostgreSQL 16 db.t4g.micro) is kept as a
+**diagnostic**, not as a capacity number:
+
+| Scenario | Result |
+|---|---|
+| `steady`, 50 req/s | p50/p95/p99 129/2325/7656 ms, 2.61% errors, 948 dropped, 0 × 429, ledger balanced (net 0): **fail (latency, errors)** |
+
+- It failed because of a design limit, not because of the load generator: every capture queues on the
+  shared platform account rows. See
+  [Known scaling limits](../../docs/DESIGN.md#known-scaling-limits).
+- The observed max was approximately the configured 10 s client timeout, so client-side timeouts may
+  have contributed to the error rate; the saved result does not provide an error-type breakdown.
+- No threshold was changed. Details: [results/aws-diagnostic-steady-50.md](results/aws-diagnostic-steady-50.md).

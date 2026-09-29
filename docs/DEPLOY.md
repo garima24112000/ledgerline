@@ -1,4 +1,6 @@
-# Deploying Ledgerline to AWS (Phase 9)
+# Deploying Ledgerline to AWS
+
+Built in Phase 9. Deployed, verified and torn down on 2026-09-29 ([what was verified](#verified-deployment-2026-09-29)).
 
 Everything runs in **us-east-1 (N. Virginia)**, in AZs us-east-1a and us-east-1b:
 
@@ -60,8 +62,14 @@ Docker is **not** needed for AWS: images are built on GitHub's amd64 runners.
      --query 'Quota.Value'    # Running On-Demand Standard instances (vCPUs): need >= 8
    aws ec2 describe-addresses --region us-east-1 --query 'length(Addresses)'   # default limit is 5
    ```
-4. **A budget alert** (strongly recommended). Billing → Budgets → Create budget, e.g. $20/month with
-   an email at 50%. It is deliberately not in Terraform, so it outlives `aws-down.sh`.
+4. **A budget alert** (strongly recommended). Billing → Budgets → Create budget. The deployment used
+   `ledgerline-monthly-budget`, a **$10/month** cost budget
+   ([screenshot](images/aws-budget.png)). It is deliberately not in Terraform, so it outlives `aws-down.sh`.
+   Check it with:
+   ```bash
+   aws budgets describe-budgets --account-id "$(aws sts get-caller-identity --query Account --output text)" \
+     --query 'Budgets[].{Name:BudgetName,Limit:BudgetLimit.Amount,Unit:BudgetLimit.Unit}' --output table
+   ```
 5. **`terraform.tfvars`:**
    ```bash
    cp infra/terraform/terraform.tfvars.example infra/terraform/terraform.tfvars
@@ -124,6 +132,41 @@ curl -s "http://$ALB/actuator/health"                    # {"status":"UP",...}
 open "http://$ALB/swagger-ui.html"
 ```
 The ALB's DNS name can take 1–3 minutes to resolve after the Ingress gets its address.
+
+Grafana has no Ingress on EKS. Reach it through a port-forward (the Ledgerline dashboard is provisioned):
+```bash
+kubectl --context ledgerline-eks -n monitoring port-forward svc/kube-prometheus-stack-grafana 3000:80
+kubectl --context ledgerline-eks -n monitoring get secret kube-prometheus-stack-grafana \
+  -o jsonpath='{.data.admin-password}' | base64 --decode; echo      # user: admin
+open http://localhost:3000
+```
+
+### Verified deployment (2026-09-29)
+
+| Check | Result | Evidence |
+|---|---|---|
+| deploy.yml via GitHub OIDC from `main` | CI → preflight → 4 images + Lambda code → Helm upgrade, green in 4m31s | [screenshot](images/github-actions-deploy-success.png) |
+| Pods on EKS (3 × c7i-flex.large) | All Running | [screenshot](images/eks-pods-running.png) |
+| ALB (AWS Load Balancer Controller) | Ingress `ledgerline-gateway-api`, class `alb` | [screenshot](images/eks-alb-ingress.png) |
+| Public health check through the ALB | `HTTP 200`, `{"status":"UP"}` | [screenshot](images/eks-public-health-check.png) |
+| Audit Lambda | All 4 checks passed, report `audits/2026-09-29.json` in S3 | [invoke](images/lambda-audit-success.png), [list](images/s3-audit-report-list.png), [report](images/s3-audit-report-details.png) |
+| Prometheus/Grafana on EKS | Ledgerline dashboard with live data | [README screenshots](../README.md#screenshots) |
+| Teardown (`aws-down.sh`) | 98 Terraform-managed resources destroyed; verification found nothing chargeable left | — |
+
+The first deploy failed at "Configure AWS credentials" (`Not authorized to perform
+sts:AssumeRoleWithWebIdentity`): GitHub issues this repository's tokens with the immutable subject
+format, and the trust policy now matches it exactly ([§3](#3-github-repository-variables);
+[DESIGN.md](DESIGN.md#deployment-results-us-east-1)).
+
+### Load testing on EKS
+
+Treat k6 results against EKS as **diagnostic**, not as capacity numbers. The one saved run (50 req/s)
+failed its latency and error thresholds because every capture queues on two shared ledger rows, and
+each statement inside those locks is a round trip to RDS. The ledger stayed balanced. See
+[DESIGN.md: Known scaling limits](DESIGN.md#known-scaling-limits),
+[infra/k6/results/aws-diagnostic-steady-50.md](../infra/k6/results/aws-diagnostic-steady-50.md), and
+[RUNBOOK §8](RUNBOOK.md#8-lock-contention-on-the-ledger) for what to watch. For real in-cluster
+numbers, run k6 as a Job ([infra/k6/README.md](../infra/k6/README.md#running-against-kubernetes)).
 
 ### Manual deploy (the same commands deploy.yml runs)
 
@@ -198,6 +241,8 @@ scripts/aws-down.sh        # type "ledgerline" to confirm; 15-30 min
 It is safe to re-run, including after a partial failure or on a stack that's already gone. Check Cost
 Explorer the next day as a final confirmation.
 
+On 2026-09-29 it destroyed **98 Terraform-managed resources**, and every verification check passed.
+
 ## 7. Common failures
 
 | Symptom | Cause | Fix |
@@ -230,7 +275,7 @@ Approximate on-demand prices in us-east-1. Check current prices before relying o
 | Resource | While it exists |
 |---|---|
 | EKS control plane (standard support) | ~$0.10/h |
-| 3 × c7i-flex.large (EC2) | Not quoted: the on-demand c7i-flex.large price is not quoted here: this AWS account reported the type as Free Tier eligible during deployment, so free-tier usage or account credits may cover part or all of it |
+| 3 × c7i-flex.large (EC2) | Not quoted: this account reported the type as Free Tier eligible during deployment, so free-tier usage or account credits may cover part or all of it |
 | 3 × 20 GB gp3 root volumes | <$0.01/h |
 | NAT gateway (+ per GB processed) | ~$0.045/h |
 | ALB (+ LCU) | ~$0.023/h |

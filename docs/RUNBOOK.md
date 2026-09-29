@@ -1,7 +1,10 @@
 # Ledgerline runbook: debugging on Kubernetes
 
-Commands for a live cluster: EKS (`ledgerline-eks` context), or kind (`kind-ledgerline`), where every
-command below was run and checked. RDS-specific steps apply only on EKS.
+Commands for a live cluster: EKS (`ledgerline-eks` context, us-east-1, 3 × c7i-flex.large, ALB) or
+kind (`kind-ledgerline`). Every command below was run and checked on kind. On EKS, the Phase 9
+deployment used the JVM debugging flow in [§4](#4-debug-containers-jcmd-and-network-tools), the
+audit Lambda invoke, `kubectl get ingress` and a `pg_stat_activity` lock query. RDS-specific steps
+apply only on EKS.
 
 ```bash
 kubectl config use-context ledgerline-eks     # kind: kind-ledgerline
@@ -27,7 +30,7 @@ were checked by running the image:
 | `java`, `jfr` | **`jcmd`, `jstack`, `jmap`** (JDK tools; a JRE doesn't have them) |
 
 So: `kubectl exec` for the first column, and an **ephemeral debug container** (`kubectl debug`,
-[below](#debug-containers-jcmd-and-network-tools)) for the second. Nothing can be installed in the app
+[below](#4-debug-containers-jcmd-and-network-tools)) for the second. Nothing can be installed in the app
 container: the filesystem is read-only and the user isn't root.
 
 ## 1. First look
@@ -106,35 +109,45 @@ restart. It inherits the pod's `runAsUser: 10001`, which is what jcmd needs: it 
 JVM running as the same user. It can't be removed afterwards. It stops when you exit, and it goes
 away with the pod.
 
-Two ways to use one:
-- **Interactive:** `kubectl debug -it "$POD" ... -- bash` (below). The container stops when you exit the shell.
-- **One-off commands** (scripts, or when attaching is flaky): start it with a long `sleep`, then `exec` into it:
-  ```bash
-  kubectl debug "$POD" --image=eclipse-temurin:21-jdk --target=gateway-api --profile=restricted \
-    --container=jdk-debug --quiet -- sleep 1800
-  kubectl exec "$POD" -c jdk-debug -- jcmd 1 GC.heap_info
-  ```
+### JDK tools with an ephemeral `eclipse-temurin:21-jdk` container (used on EKS)
+Same JVM version as the app, plus `jcmd`. Start the debug container with a long `sleep`, then run
+each tool with `kubectl exec`. This is the flow used on EKS: it doesn't depend on an interactive
+attach, and every command is one line you can script or paste.
+```bash
+POD=$(kubectl get pod -l app.kubernetes.io/name=gateway-api -o jsonpath='{.items[0].metadata.name}')
+kubectl debug "$POD" --image=eclipse-temurin:21-jdk --target=gateway-api --profile=restricted \
+  --container=jdk-debug --quiet -- sleep 1800
+kubectl get pod "$POD" -o jsonpath='{.status.ephemeralContainerStatuses[*].state}'; echo   # "running" once the image is pulled
 
-### JDK tools (`eclipse-temurin:21-jdk`: same JVM version, plus jcmd)
+kubectl exec "$POD" -c jdk-debug -- jcmd 1 VM.version
+kubectl exec "$POD" -c jdk-debug -- jcmd 1 Thread.print > threads.txt            # platform threads, with locks
+kubectl exec "$POD" -c jdk-debug -- jcmd 1 Thread.dump_to_file -overwrite -format=json /tmp/vthreads.json   # incl. virtual threads
+kubectl exec "$POD" -c jdk-debug -- jcmd 1 GC.heap_info                          # heap regions, used/committed
+kubectl exec "$POD" -c jdk-debug -- jcmd 1 VM.flags                              # effective -XX flags (MaxHeapSize from MaxRAMPercentage)
+kubectl exec "$POD" -c jdk-debug -- jcmd 1 GC.class_histogram | head -25       # what fills the heap
+```
+- `jcmd 1` works because the debug container shares the app's process namespace (`--target`) and
+  inherits `runAsUser: 10001`. jcmd can only attach to a JVM running as the same user.
+- File paths such as `/tmp/vthreads.json` are resolved by the **app's** JVM, so the file lands in
+  the app container's `/tmp`. Copy it out through the app container:
+  `kubectl cp -c gateway-api "$POD":/tmp/vthreads.json ./vthreads.json`.
+- `jcmd 1 VM.native_memory summary` works only if the JVM was started with
+  `-XX:NativeMemoryTracking=summary`, which it isn't by default.
+- An ephemeral container can't be removed or restarted. After `sleep` ends, `kubectl debug` again
+  with a **new** `--container` name (e.g. `jdk-debug-2`). They all go away when the pod is replaced.
+
+**Interactive alternative** (verified on kind): a shell in the same kind of container. It stops
+when you exit.
 ```bash
 kubectl debug -it "$POD" --image=eclipse-temurin:21-jdk --target=gateway-api --profile=restricted -- bash
+# inside: jcmd 1 VM.version, jcmd 1 GC.heap_info, ... (same commands as above, without kubectl exec)
 ```
-Inside:
-```bash
-jcmd 1 VM.version
-jcmd 1 Thread.print > /tmp/threads.txt            # platform threads, with locks
-jcmd 1 Thread.dump_to_file -overwrite -format=json /tmp/vthreads.json    # incl. virtual threads
-ls -l /proc/1/root/tmp/vthreads.json               # file paths are resolved by the APP's JVM: its /tmp
-jcmd 1 GC.heap_info                                # heap regions, used/committed
-jcmd 1 VM.flags                                    # the effective -XX flags (MaxHeapSize from MaxRAMPercentage)
-jcmd 1 GC.class_histogram | head -25               # what fills the heap
-jcmd 1 VM.native_memory summary                    # only if started with -XX:NativeMemoryTracking=summary (not by default)
-```
+
 A heap dump also goes to the **app's** `/tmp`. Copy it out through the app container, then delete
 it, because the emptyDir lives on the node's disk (on kind a dump of the gateway was ~85 MB):
 ```bash
-jcmd 1 GC.heap_dump /tmp/heap.hprof                                   # in the debug container
-kubectl cp -c gateway-api "$POD":/tmp/heap.hprof ./heap.hprof          # from your laptop
+kubectl exec "$POD" -c jdk-debug -- jcmd 1 GC.heap_dump /tmp/heap.hprof
+kubectl cp -c gateway-api "$POD":/tmp/heap.hprof ./heap.hprof
 kubectl exec "$POD" -c gateway-api -- rm /tmp/heap.hprof
 ```
 
@@ -219,3 +232,55 @@ aws elbv2 describe-target-health --region us-east-1 --target-group-arn "$TG" \
 Targets are pod IPs (`target-type: ip`), health-checked on `/actuator/health/readiness`. `unhealthy`
 targets usually mean the pod isn't Ready (e.g. the database is down). A `curl` that times out while the
 targets are healthy means your IP isn't in `INGRESS_ALLOWED_CIDRS`.
+
+## 8. Lock contention on the ledger
+
+Symptoms: p99 of `POST /v1/payments` and of `ledger_post_seconds` climbs to seconds,
+`hikaricp_connections_pending` grows into the hundreds, and the median barely moves. This is
+the known hot-row limit ([DESIGN.md: Known scaling limits](DESIGN.md#known-scaling-limits)): every
+capture locks the shared `CUSTOMER_FUNDS` and `PLATFORM_FEES` rows.
+
+From the app's metrics (section 3, inside the gateway container):
+```bash
+curl -s localhost:8080/actuator/prometheus | grep -E '^hikaricp_connections_(pending|active|max)'
+curl -s localhost:8080/actuator/prometheus | grep -E '^ledger_post_seconds_(count|sum)'
+```
+
+From Postgres: on EKS use the psql pod from [section 5](#5-rds-connectivity-eks). Locally, use
+`docker compose -f infra/docker-compose.yml exec postgres psql -U ledgerline ledgerline`.
+```sql
+-- Who is waiting on a lock, and for how long.
+SELECT pid, wait_event_type, wait_event, now() - query_start AS running_for, left(query, 90) AS query
+FROM pg_stat_activity
+WHERE datname = current_database() AND wait_event_type = 'Lock'
+ORDER BY query_start;
+
+-- Who blocks whom.
+SELECT waiting.pid AS waiting_pid, blocking.pid AS blocking_pid,
+       left(waiting.query, 60) AS waiting_query, left(blocking.query, 60) AS blocking_query
+FROM pg_stat_activity waiting
+JOIN LATERAL unnest(pg_blocking_pids(waiting.pid)) AS b(pid) ON true
+JOIN pg_stat_activity blocking ON blocking.pid = b.pid;
+```
+How to read it:
+- Many sessions in `Lock:tuple` or `Lock:transactionid` on
+  `SELECT id FROM accounts WHERE id IN (...) ORDER BY id FOR UPDATE`, plus `COMMIT`, is the hot-row
+  queue ([example snapshot from EKS](images/postgres-lock-contention.png)). The blocking pids are
+  captures holding the platform account rows until COMMIT.
+- Scaling out gateway pods won't help: it only adds waiters. The options are in DESIGN.
+- Afterwards, confirm the ledger is intact:
+  `curl -u "$ADMIN_USERNAME:$ADMIN_PASSWORD" http://<gateway>/admin/ledger/verify` should report every
+  entry balanced and a global net of 0.
+- Requests that waited more than 10 s can lose their idempotency lock to the reconciler, and then
+  fail even though their payment was resolved. That is the secondary race in DESIGN.
+
+## 9. Grafana and Prometheus on EKS
+
+No Ingress: port-forward. The Ledgerline dashboard is provisioned by the chart.
+```bash
+kubectl --context ledgerline-eks -n monitoring port-forward svc/kube-prometheus-stack-grafana 3000:80
+kubectl --context ledgerline-eks -n monitoring get secret kube-prometheus-stack-grafana \
+  -o jsonpath='{.data.admin-password}' | base64 --decode; echo            # user: admin
+kubectl --context ledgerline-eks -n monitoring get svc | grep prometheus   # then port-forward the -prometheus service on 9090
+```
+The panels to watch under load are "Ledger post latency" and "Hikari pool (gateway-api)".

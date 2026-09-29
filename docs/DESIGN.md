@@ -50,7 +50,8 @@ Swagger UI at `/swagger-ui.html`.
   and the ledger (see [Ledger](#ledger)); `V3__payments.sql` adds payments, refunds, idempotency keys
   and the demo merchants (see [Payments](#payments)); `V4__outbox.sql` adds the transactional outbox
   (see [Outbox](#outbox)); `V5__rate_limit_tiers.sql` reduces the tiers to FREE and PRO (see
-  [Rate limiting](#rate-limiting)).
+  [Rate limiting](#rate-limiting)); `V6__demo_webhook_url.sql` points the demo merchants at
+  demo-merchant (see [the demo merchants' webhook URL](#the-demo-merchants-webhook-url-one-time-seed-configuration)).
 - Flyway 10 needs `flyway-database-postgresql` alongside `flyway-core`.
 - `open-in-view: false`, so no lazy loading can happen in the web layer, and each transaction
   boundary is explicit in the service layer.
@@ -174,9 +175,10 @@ gives nicer errors. The database is the authority:
   order, that cycle can't form. The plan below shows the `ORDER BY` is satisfied by the primary-key
   index scan under `LockRows`, so rows are locked in id order as they come off the index.
 - **Hot rows:** every capture locks `CUSTOMER_FUNDS` and `PLATFORM_FEES`, so all captures across all
-  merchants serialize on those two rows for the length of the transaction. This is fine at this
-  project's scale. The usual fix is to split each platform account into N sub-accounts and pick one
-  at random (sum them for reporting).
+  merchants serialize on those two rows for the length of the transaction. This sets the local
+  capacity knee (about 230 req/s), and on AWS, with a network round trip to RDS inside the lock, it
+  dominated. It is **not fixed**. See [Known scaling limits](#known-scaling-limits) for the
+  evidence and the options (for example, splitting each platform account into N sub-accounts).
 - **JPA vs SQL:** `Account` and `Merchant` are JPA entities (lookups, onboarding). The posting path
   is `JdbcClient` SQL, following the rule to use plain SQL where locking matters. `Account.balance`
   is mapped `insertable = false, updatable = false`, so a stale entity can never overwrite a balance.
@@ -444,7 +446,9 @@ queues them instead: each waits once, and all 50 succeed.
 The costs of pessimistic locking: waiting holds a pooled connection, and a slow lock holder
 stalls everyone behind it. So **never hold a row lock across a network call**. The call to
 mock-bank happens *before* the ledger transaction, never inside it. Keep the locked section to a
-few milliseconds of SQL.
+few milliseconds of SQL. On AWS, even that SQL crosses the network to RDS. Every statement inside
+the lock adds a round trip, and that is how the hot rows became the limit there
+([Known scaling limits](#known-scaling-limits)).
 
 In this project: the ledger uses pessimistic locking. `Account` still carries `@Version`, so any
 future JPA edit of an account (such as toggling `allow_negative`) fails loudly instead of
@@ -1628,8 +1632,8 @@ Code: `infra/k6/` (how to run it and how to read the numbers: `infra/k6/README.m
   run in `results/<UTC timestamp>/`. Failed thresholds don't stop the later scenarios; the exit
   code reports them at the end.
 
-### Results: where the payment path saturates
-Final local measurements: MacBook, the whole stack and k6 on one machine, two PRO merchants
+### Results: local benchmark (where the payment path saturates)
+This is the capacity benchmark. Final local measurements: MacBook, the whole stack and k6 on one machine, two PRO merchants
 (Book Nook and Pixel Prints), mock-bank without timeouts. Details are in `infra/k6/results/`.
 
 | Run | p50 / p95 / p99 | Errors | 429s | Dropped | Ledger |
@@ -1664,23 +1668,111 @@ requests waiting for one of its 10 connections, and most Postgres sessions were 
   holds them until COMMIT.
 - Near that limit, the queue grows after any hiccup and drains slowly, which shows up as tail
   latency.
-- That profiling was not repeated at the 231/232 req/s boundary.
+- That profiling was not repeated at the 231/232 req/s boundary. The AWS run below showed the same
+  wait events on the same query.
+- `duplicate_storm` is barely affected: 6000 requests, but only 620 did real work. Duplicates are
+  cheap (a no-op `INSERT` plus a `SELECT`, no bank call, no ledger lock).
 
-The ledger's correctness design (row locks in id order, balances updated in the same transaction)
-is what serialises it. Options, not built yet:
+The limitation, the evidence and the options are in [Known scaling limits](#known-scaling-limits).
+
+### AWS diagnostic run (not a benchmark)
+One `steady` run on EKS is kept as a **diagnostic**. It is not a capacity or throughput number, and
+it is not comparable with the local table above.
+- **Setup:** us-east-1, 3 × c7i-flex.large, RDS PostgreSQL 16 db.t4g.micro.
+- **Result file:** [infra/k6/results/aws-diagnostic-steady-50.md](../infra/k6/results/aws-diagnostic-steady-50.md).
+
+| Run | p50 / p95 / p99 | Errors | 429s | Dropped | Ledger |
+|---|---|---|---|---|---|
+| steady 50 req/s (EKS + RDS) | 129 / 2325 / **7656 ms** (max 9999 ms) | **2.61%** | 0 | 948 | balanced, net 0 |
+
+- **It failed both thresholds** (`accepted_latency` p99 < 300 ms and `errors` < 1%) at less than a
+  quarter of the local healthy rate. **No threshold was relaxed.**
+- **Why it isn't comparable with the local runs:**
+  - Every statement is a network round trip to RDS, including the ones made while the platform
+    account locks are held, so each lock is held longer.
+  - The database is a db.t4g.micro.
+  - Client: MacBook → public AWS ALB (not an in-cluster k6 Job).
+- **Errors:** The observed max was approximately the configured 10 s client timeout, so client-side
+  timeouts may have contributed to the error rate; the saved result does not provide an error-type
+  breakdown.
+- **Correctness held:** all entries were balanced and the global net was 0 after the run, as in
+  every local run.
+
+## Known scaling limits
+
+These are limits of the current design, found under load. **None of them is fixed in this
+codebase.** They are documented here instead.
+
+### 1. Hot platform account rows (primary)
+**Mechanism.** Every capture posts to the merchant's account and to the two platform-wide accounts
+`CUSTOMER_FUNDS` and `PLATFORM_FEES`. [`LedgerService.post`](#posting-one-transaction-ordered-row-locks)
+runs these steps in order:
+1. It locks all three rows with
+   `SELECT id FROM accounts WHERE id IN (...) ORDER BY id FOR UPDATE`.
+2. It inserts the entry and its postings.
+3. It updates the cached balances.
+4. The caller (`PaymentTransitions.recordBankResult`) then writes the outbox row and completes the
+   idempotency key.
+
+The locks are held until COMMIT. So every capture, for every merchant, waits in one queue for the
+same two rows. That is what makes the ledger correct under concurrency: ordered locks mean no
+deadlocks, and balances change in the same transaction as the postings. It is also what caps
+throughput.
+
+**Evidence:**
+- **Locally:** a knee at about 230 req/s. p99 is flat up to 231 req/s and doubles at 232
+  ([local benchmark](#results-local-benchmark-where-the-payment-path-saturates)).
+- **On AWS:**
+  - The [diagnostic run](#aws-diagnostic-run-not-a-benchmark) failed at 50 req/s.
+  - Postgres showed sessions in `Lock:tuple` and `Lock:transactionid` on the `accounts … FOR UPDATE`
+    query, and on `COMMIT` ([screenshot](images/postgres-lock-contention.png): one
+    `pg_stat_activity` snapshot).
+  - Grafana showed ledger-post p99 of several seconds, up to about 8 s, and a Hikari pending count
+    of about 1,250 ([screenshot](images/grafana-jvm-database.png)).
+  - Each statement inside the lock pays an RDS network round trip, so every lock is held longer
+    than on a laptop, and the queue behind it grows faster.
+- **Invariants held under this overload:** `/admin/ledger/verify` reported every entry balanced and
+  a global net of 0.
+
+The root-cause conclusion: this is **primarily a design bottleneck** (a global serialization point),
+**amplified by RDS/network latency**. It is not an infrastructure sizing problem that more pods
+would fix: more gateway replicas only add more waiters for the same two rows.
+
+### 2. Idempotency lock vs reconciler, under long waits (secondary)
+This one only appears when (1) pushes transactions past 10 s:
+1. A request holds its idempotency key with `lock-ttl: 10s`, sized for the bank's 2 s read timeout.
+2. The request is then stuck waiting for a connection and the account locks for more than 10 s, so
+   its key lock expires.
+3. The reconciler (every 10 s, `min-age: 5s`) sees the payment still PENDING. `tryLock` succeeds
+   because the lock has expired. The reconciler asks the bank for the outcome and records it, which
+   also completes the key.
+4. The original request finally reaches `recordBankResult`. Its `saveAndFlush` fails the payment's
+   `@Version` check, and the client gets an error.
+
+**Effect:** the client gets an error for a payment the reconciler has already resolved. The
+payment is never transitioned twice: the `@Version` check rejects the second writer before it takes
+any ledger lock. A retry with the same Idempotency-Key replays the recorded outcome. It is still a
+wrong answer to the client, and it adds to the error rate under overload.
+
+### Options (not built)
 - **Keep the platform-side balances out of the hot path.** Leave cached balances only on merchant
   accounts. Derive `CUSTOMER_FUNDS`/`PLATFORM_FEES` from `SUM(postings)`, or roll them up
   asynchronously. The deferred balance trigger still guarantees every entry balances.
 - **Split a hot account into N sub-accounts** (shards), picked at random per entry and summed when
   read. This is the usual answer for "house" accounts.
-- **Shorten the lock hold.** `PaymentTransitions` posts the ledger entry *first*, then writes the
-  outbox row and completes the idempotency key while still holding the account locks. Posting the
-  ledger entry last would cut the time the locks are held. It would not change what the
-  transaction commits.
+- **Shorten the hot-row lock window.**
+  - Today the accounts are locked before the journal and posting inserts. The outbox row and the
+    idempotency key are then written while the locks are still held.
+  - Instead: insert the immutable journal/posting rows before the shared balance updates, and apply
+    the shared account balance updates in deterministic order at the end of the transaction.
+  - It commits the same data, but holds the locks for less time.
 - **Fail fast under overload.** A shorter Hikari `connectionTimeout`, or a global concurrency limit,
   so excess load gets a quick 503 instead of queueing for seconds.
-- `duplicate_storm` is barely affected: 6000 requests, but only 620 did real work. Duplicates are
-  cheap (a no-op `INSERT` plus a `SELECT`, no bank call, no ledger lock).
+- **Close the race in (2):**
+  - make the idempotency lease safe under database latency (renew it while the request is working,
+    or tie the TTL to the real worst case);
+  - have the reconciler skip PENDING payments whose key is still inside a live lease;
+  - on a `@Version` conflict, return the payment's resolved state instead of an error.
 
 ## Observability
 
@@ -2438,17 +2530,21 @@ linearly, to ~2.5 s. The UNKNOWN check reads only the tiny partial index, howeve
 | Resource | Cost |
 |---|---|
 | EKS control plane | $0.10/h |
-| 3 × c7i-flex.large | Not quoted: the on-demand c7i-flex.large price is not quoted here: this AWS account reported the type as Free Tier eligible during deployment, so free-tier usage or account credits may cover part or all of it |
+| 3 × c7i-flex.large | Not quoted: this account reported the type as Free Tier eligible, so free-tier usage or account credits may cover part or all of it |
 | NAT gateway | ~$0.045/h |
 | ALB | ~$0.023/h |
 | Public IPv4 | ~$0.015/h |
 | RDS micro | ~$0.02/h |
 | EBS, ECR, S3, CloudWatch, Lambda, Scheduler, SSM | cents |
 
-Hence session-sized use, `aws-down.sh`'s verification table, and a manual AWS Budget alert. Details
+Hence session-sized use, `aws-down.sh`'s verification table, and a manual AWS Budget
+(`ledgerline-monthly-budget`, $10/month, created outside Terraform so it outlives teardown). Details
 in [DEPLOY.md](DEPLOY.md#costs).
 
 ### Known limitations
+- **Throughput is capped by two hot ledger rows.** Every capture locks the shared platform accounts,
+  and on AWS the RDS round trips inside those locks made it much worse. This is not fixed; see
+  [Known scaling limits](#known-scaling-limits).
 - HTTP only (no TLS); single NAT; single-AZ RDS; single Kafka broker; Redis/Kafka not managed.
 - `sslmode=require` encrypts but doesn't verify the RDS certificate (verify-full needs the RDS CA
   bundle in the images).
@@ -2484,6 +2580,29 @@ in [DEPLOY.md](DEPLOY.md#costs).
   - After the apply, all 3 nodes were Ready: 2 in us-east-1a, 1 in us-east-1b, amd64, Amazon Linux 2023.
   - A second `terraform apply` reported 0 to add, 0 to change, 0 to destroy.
   - Per node: 29 pods, ~3.07 GiB memory, 1930m CPU allocatable.
+- **The first deploy was rejected by the OIDC trust policy:**
+  - The deploy failed with `Not authorized to perform sts:AssumeRoleWithWebIdentity`. The trust
+    policy expected the legacy subject `repo:<owner>/<repo>:ref:refs/heads/main`.
+  - A temporary workflow job printed the token's claims (never the token itself). It showed that
+    this repository's tokens carry GitHub's **immutable** subject format, with numeric ids:
+    `repo:<owner>@<owner-id>/<repo>@<repo-id>:ref:refs/heads/main`.
+  - The fix: Terraform builds that exact subject from `github_owner_id` / `github_repository_id`.
+    It is still `StringEquals`, with no wildcard. The diagnostic job was removed afterwards.
+- **After that, the deployment worked end to end:**
+  - `deploy.yml` went green: CI, preflight, 4 images, Lambda code, Helm upgrade (about 4.5 min).
+  - All pods (gateway-api ×2, webhook-dispatcher, mock-bank, demo-merchant, Kafka, Redis) were Running.
+  - The ALB (AWS Load Balancer Controller, `target-type: ip`) served `/actuator/health` =
+    `UP` to the allowed CIDR.
+  - Prometheus and Grafana ran on EKS, reached through `kubectl port-forward`.
+  - Screenshots are in the [README](../README.md#screenshots).
+- **The audit Lambda**, invoked by hand, passed all four checks in 505 ms and wrote
+  `audits/2026-09-29.json` to the audit bucket.
+- **Load testing exposed the hot-row limit.** The diagnostic run and the lock waits are described in
+  [AWS diagnostic run](#aws-diagnostic-run-not-a-benchmark) and
+  [Known scaling limits](#known-scaling-limits). The ledger stayed balanced (net 0).
+- **Teardown:** `aws-down.sh` destroyed 98 Terraform-managed resources. Its verification table
+  found nothing chargeable left.
+- **Cost control:** AWS Budget `ledgerline-monthly-budget`, $10/month.
 
 ### Testing (Phase 9)
 - `mvn -q clean verify`: all modules green, including the 11 new Lambda tests (7 unit, 4 integration).
@@ -2500,8 +2619,32 @@ in [DEPLOY.md](DEPLOY.md#costs).
   webhook is delivered, `/admin/ledger/verify` is consistent, and the Grafana datasource uid is
   `prometheus`. Every RUNBOOK command (exec, SIGQUIT thread dump, jcmd in an ephemeral JDK
   container, heap dump + `kubectl cp`, netshoot `ss`/`nslookup`/`dig`, the psql pod) was run on kind.
-- Verified on AWS so far: `terraform apply` (after the recovery above) is stable at 0/0/0, and 3 nodes
-  are Ready. The GitHub repository variables are set.
-- Not yet verified: deploy.yml (images, Lambda code, Helm), the ALB, RDS from the pods, the Lambda in
-  AWS, OIDC rejection from other branches, and aws-down.sh. That is the rest of the Phase 9
-  verification sequence.
+- **Verified on AWS:**
+  - `terraform apply` (after the recovery above) is stable at 0/0/0, with 3 nodes Ready;
+  - the GitHub repository variables;
+  - deploy.yml via OIDC from `main` (images, Lambda code, Helm);
+  - the ALB and the public health check from the allowed CIDR;
+  - the gateway on RDS (payments were captured and `/admin/ledger/verify` was balanced);
+  - the audit Lambda and its S3 report;
+  - Prometheus/Grafana on EKS;
+  - JVM debugging with an ephemeral `eclipse-temurin:21-jdk` container (`sleep` + `kubectl exec
+    … jcmd`, see [RUNBOOK](RUNBOOK.md#4-debug-containers-jcmd-and-network-tools));
+  - `aws-down.sh`: 98 resources destroyed, verification passed.
+- **Not verified:** that OIDC *rejects* other branches (only the trust policy's exact match is
+  evidence of that), and a real Lambda failure reaching the alarms.
+
+## Documentation (Phase 10)
+Phase 10 changed documentation only: README, this file, DEPLOY, RUNBOOK, the k6 README, and one
+curated result file. No code, chart, Terraform, workflow or k6 script changed.
+- **Two kinds of load-test result, kept apart.**
+  - The local runs are the capacity benchmark: healthy up to about 230 req/s on one MacBook.
+  - The AWS run is labelled a diagnostic everywhere it appears. A run that failed its thresholds
+    shows where the design stops scaling. It is not a throughput figure.
+- **No threshold was relaxed** to make a run pass. The failures are kept as measurements.
+- **The hot-row contention is documented as a known limit, not as fixed.**
+  [Known scaling limits](#known-scaling-limits) gives the mechanism, the evidence, the secondary
+  idempotency/reconciler race, and the options, none of which is built.
+- **Screenshots are captioned as evidence.** The Grafana images were taken during the AWS
+  diagnostic load, so their spikes are the contention, not normal operation. Each caption claims
+  only what the image shows. For example, the `pg_stat_activity` image is a single snapshot, and the
+  several-second waits come from the Grafana ledger-post panel.

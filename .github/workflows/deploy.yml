@@ -34,9 +34,36 @@ jobs:
   ci:
     uses: ./.github/workflows/ci.yml
 
+  # TEMPORARY diagnostic: print the OIDC claims GitHub actually issues, to compare with the deploy
+  # role's trust policy (sub = repo:<owner>/<repo>:ref:refs/heads/main). Remove once AssumeRole works.
+  # Prints selected payload claims only: never the raw token, never AWS credentials. Makes no AWS call.
+  oidc-claims:
+    name: OIDC claims (temporary)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Decode the OIDC token payload
+        run: |
+          set -euo pipefail
+          token="$(curl -sSf \
+                     -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+                     "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r '.value')"
+          echo "::add-mask::$token"
+          # JWT = header.payload.signature; the payload is base64url without padding.
+          payload="$(cut -d. -f2 <<<"$token" | tr '_-' '/+')"
+          case $(( ${#payload} % 4 )) in
+            2) payload="${payload}==" ;;
+            3) payload="${payload}=" ;;
+          esac
+          base64 --decode <<<"$payload" | jq '{aud, sub, repository, repository_id, repository_owner,
+                                                repository_owner_id, ref, job_workflow_ref}'
+
   preflight:
     name: Preflight
-    needs: ci
+    needs: [ci, oidc-claims] # oidc-claims is TEMPORARY: drop it from needs when the job is removed
     # While the stack is torn down (aws-down.sh sets DEPLOY_ENABLED=false) pushes skip the deploy
     # instead of failing.
     if: vars.DEPLOY_ENABLED == 'true'

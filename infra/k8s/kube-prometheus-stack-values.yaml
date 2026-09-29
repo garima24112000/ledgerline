@@ -1,0 +1,47 @@
+# kube-prometheus-stack for the kind cluster (chart version pinned in scripts/kind-up.sh).
+# Prometheus Operator + Prometheus + Grafana; Alertmanager is off (no alert rules of our own yet).
+
+prometheus:
+  prometheusSpec:
+    # By default the operator only picks ServiceMonitors labelled release=<this release>.
+    # false = select every ServiceMonitor in every namespace, so the ledgerline chart needs no
+    # knowledge of how the monitoring stack was installed.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    scrapeInterval: 15s
+    retention: 2d
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+
+alertmanager:
+  enabled: false
+
+grafana:
+  adminUser: admin
+  adminPassword: admin # dev only, same as docker-compose
+  # Kubernetes/node dashboards are useful when watching the HPA scale gateway-api.
+  defaultDashboardsEnabled: true
+  sidecar:
+    datasources:
+      # The Ledgerline dashboard refers to its datasource by this uid. Pinned here explicitly rather
+      # than relying on the chart default; scripts/kind-up.sh checks it through Grafana's API.
+      uid: prometheus
+    dashboards:
+      # The dashboard ConfigMap (label grafana_dashboard: "1") lives in the ledgerline namespace.
+      searchNamespace: ALL
+  grafana.ini:
+    auth.anonymous:
+      enabled: true
+      org_role: Viewer
+    dashboards:
+      # The sidecar writes each dashboard ConfigMap key into /tmp/dashboards.
+      default_home_dashboard_path: /tmp/dashboards/ledgerline-dashboard.json
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    hosts:
+      - grafana.localtest.me
+    path: /

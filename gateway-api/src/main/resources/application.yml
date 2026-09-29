@@ -17,6 +17,9 @@ spring:
       ddl-auto: validate # schema is owned by Flyway, Hibernate only checks it
   flyway:
     locations: classpath:db/migration
+    placeholders:
+      # Used once, by V6, when the database is first migrated. Changing it later has no effect.
+      demo_webhook_url: ${DEMO_WEBHOOK_URL:http://localhost:8083/webhooks}
   data:
     redis:
       host: ${REDIS_HOST:localhost}

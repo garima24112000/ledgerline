@@ -22,10 +22,28 @@ make run-all   # builds and starts all four apps; logs in logs/<app>.log
 make test      # unit + integration tests (Testcontainers)
 ```
 
+## Run it on Kubernetes (kind)
+
+Needs Docker, [kind](https://kind.sigs.k8s.io/), kubectl and Helm. Ports 80 and 443 must be free, and
+Docker needs ~6 GB of free memory (stop the compose stack with `make down` first).
+
+```bash
+make kind-up     # kind cluster (1 control plane + 2 workers), images, ingress-nginx, metrics-server,
+                 # kube-prometheus-stack and the ledgerline chart (infra/helm/ledgerline); ~10 min the first time
+make kind-down   # delete the cluster
+```
+
+- Gateway API: <http://api.localtest.me/swagger-ui.html> (`*.localtest.me` resolves to 127.0.0.1)
+- Grafana: <http://grafana.localtest.me> (Ledgerline dashboard is the home page; `admin`/`admin` to edit)
+- `kubectl -n ledgerline get pods,hpa`, and `kubectl -n ledgerline logs deploy/ledgerline-demo-merchant -f` for webhooks
+
+The `curl` examples below work against the cluster too, if you replace `localhost:8080` with `api.localtest.me`.
+For EKS, `infra/helm/ledgerline/values-eks.yaml` is only scaffolding for now (see DESIGN.md, Kubernetes).
+
 ## Observability
 
 - **Grafana:** <http://localhost:3000/d/ledgerline>. The Prometheus datasource and the Ledgerline
-  dashboard are provisioned from `infra/grafana/`. Open it anonymously, or log in as `admin`/`admin`.
+  dashboard are provisioned from `infra/grafana/` and `infra/helm/ledgerline/dashboards/`. Open it anonymously, or log in as `admin`/`admin`.
   It shows request rate, p50/p95/p99 latency, 4xx/5xx, 429s per tier, payment/bank/ledger timings,
   outbox lag, webhook outcomes, JVM heap and the Hikari pool.
 - **Prometheus:** <http://localhost:9090/targets>. It scrapes all four apps on the host every 5 s.

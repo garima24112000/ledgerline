@@ -1404,10 +1404,9 @@ Kafka, and a slow or down broker can't stall `/actuator/prometheus`.
 ### Observed on a fresh broker
 The very first dispatcher start against a brand-new local Kafka took about 2.5 minutes. Five
 listener containers each logged "Consumer thread failed to start" after Spring Kafka's 30 s wait.
-Later starts took 1.8 s, and I couldn't reproduce it. The likely cause is the first-ever consumer
-group creating `__consumer_offsets` while the virtual-thread consumers wait. If it shows up again,
-the next step is running the listener containers on platform threads, which a `ContainerCustomizer`
-can set. They are 15 long-lived pollers, so virtual threads buy nothing there.
+Later starts took 1.8 s, and I couldn't reproduce it on the laptop. **It showed up on Kubernetes
+and was confirmed as pinning** (see [Found on Kubernetes: consumers pinning the only carrier](#found-on-kubernetes-consumers-pinning-the-only-carrier)).
+The listener containers now run on platform threads, set by a `ContainerCustomizer` in `DispatcherConfig`.
 
 ### Why it's built this way (interview notes)
 
@@ -1450,13 +1449,17 @@ get no CPU. The result looks like a latency cliff or a deadlock under load, whil
   per-thread.
 - **JDK 24 (JEP 491)** lets virtual threads unmount inside `synchronized`. Native frames still pin.
 
-Here, the Kafka listener containers also run on virtual threads (Spring Boot does that when
-virtual threads are enabled). They are 15 long-lived consumers blocked in `poll()`, so they gain
-nothing. They also carry the general pinning risk: a consumer that blocks while holding a monitor,
-or inside native code, stays pinned to its carrier. If many carriers are pinned at once, fewer
-are left for the virtual threads that deliver webhooks and serve requests. The unexplained slow
-first start in [Observed on a fresh broker](#observed-on-a-fresh-broker) *may* be pinning, but that
-isn't confirmed; a later start with pin tracing showed nothing.
+Spring Boot also puts the Kafka listener containers on virtual threads when virtual threads are
+enabled. That turned out to be the one place pinning really hurt, so **the consumers now run on
+platform threads** (`DispatcherConfig.platformThreadConsumers`).
+- They are 18 long-lived consumers (6 containers × concurrency 3) blocked in `poll()`, so virtual
+  threads gave them nothing.
+- The Kafka client joins and leaves the consumer group inside `synchronized` methods of
+  `AbstractCoordinator`. During a rebalance, every consumer pins its carrier.
+- On a laptop there are 8 carriers, so this only showed as an occasional slow start. In a pod with a
+  1-CPU limit the JVM sees one CPU and gets one carrier. Tomcat's request threads got no turn, the
+  health probes timed out, and Kubernetes restarted the pod in a loop. Each restart caused another
+  rebalance. See [Found on Kubernetes](#found-on-kubernetes-consumers-pinning-the-only-carrier).
 
 #### Why is a per-merchant semaphore a bulkhead?
 A ship's hull is divided into watertight compartments (bulkheads), so a breach floods one
@@ -1758,7 +1761,9 @@ backlog. The 1,000 heap fetches happen because the seeded rows aren't in the vis
 (same transaction, no VACUUM). On a vacuumed table most of them go away.
 
 ### Dashboard and scraping
-`infra/grafana/ledgerline-dashboard.json` has the `uid` `ledgerline` and an `$application` filter.
+`infra/helm/ledgerline/dashboards/ledgerline-dashboard.json` has the `uid` `ledgerline` and an
+`$application` filter. It lives inside the Helm chart because Helm can only read files in the chart
+directory. docker-compose mounts the same file, so there is one copy (see [Kubernetes](#kubernetes)).
 It is provisioned read-only (`allowUiUpdates: false`), so the file in git is the source of truth.
 The datasource has a fixed uid (`prometheus`) that the dashboard refers to.
 
@@ -1809,7 +1814,7 @@ What goes in the MDC:
   `paymentId`/`eventId`, which the event body always carries. Scheduled jobs are not assumed to have
   a `traceId`; nothing tests that.
 - **Carrying the trace through the outbox (not built):** add a `traceparent` column to
-  `outbox_events` (V6), fill it from the current span in `OutboxService.append`, send it as a Kafka
+  `outbox_events` (a new migration), fill it from the current span in `OutboxService.append`, send it as a Kafka
   header from the relay, and turn on `spring.kafka.listener.observation-enabled` in the dispatcher.
   The dispatcher's spans would then join the original request's trace. It is left out because ids in
   the MDC already answer "what happened to payment X", and there is no trace backend to view spans in.
@@ -1827,3 +1832,288 @@ What goes in the MDC:
   `WebhookDeliveryIT` (a dead-lettered event increments `webhook_dead_lettered_total`).
 - Checked by hand: `promtool check config` passes; with `make up`, all 4 Prometheus targets are
   UP and Grafana lists the provisioned dashboard and datasource.
+
+## Kubernetes
+
+The whole system runs on a local kind cluster with one command (`make kind-up`). The same Helm
+chart is meant to deploy to EKS later.
+
+| Piece | Where |
+|---|---|
+| Images | `<module>/Dockerfile` (one per app), `.dockerignore` |
+| Cluster | `infra/k8s/kind-config.yaml`: 1 control plane (runs ingress-nginx, ports 80/443 mapped to the laptop) + 2 workers |
+| Chart | `infra/helm/ledgerline`: 4 apps, Postgres/Redis/Kafka StatefulSets, HPA, Ingress, ServiceMonitors, dashboard ConfigMap |
+| Environments | `values-kind.yaml`, `values-eks.yaml` (scaffolding only, see below) |
+| Monitoring | kube-prometheus-stack, `infra/k8s/kube-prometheus-stack-values.yaml` |
+| Bring-up | `scripts/kind-up.sh`: cluster → images → `kind load` → ingress-nginx → metrics-server → kube-prometheus-stack → chart → datasource check |
+
+```mermaid
+flowchart LR
+    laptop([laptop :80]) --> ing[ingress-nginx<br/>control-plane node]
+    ing -->|api.localtest.me| gw[gateway-api x2-6<br/>HPA]
+    ing -->|grafana.localtest.me| graf[Grafana]
+    gw --> pg[(postgres-0)]
+    gw --> rd[(redis-0)]
+    gw --> kf[(kafka-0)]
+    gw --> bank[mock-bank x1]
+    kf --> wd[webhook-dispatcher]
+    wd --> dm[demo-merchant]
+    prom[Prometheus] -. ServiceMonitors .-> gw & wd & bank & dm
+    graf --> prom
+```
+
+### Images
+- **Multi-stage.** The build stage (`maven:3.9-eclipse-temurin-21`) runs
+  `mvn -pl <module> -am package -DskipTests`. The runtime stage is `eclipse-temurin:21-jre` with only
+  the jar, so the image has no Maven, JDK or sources. That makes it about 140–200 MB of content
+  instead of ~500 MB.
+- **The build context is the repo root.** The parent pom lists all four modules, and Maven reads the
+  whole reactor even with `-pl`, so every module's `pom.xml` is copied, but only that module's `src`.
+- **The BuildKit cache mount on `~/.m2`** means the four builds download dependencies once. Tests are
+  skipped in the image build: Testcontainers needs a Docker daemon, which a `docker build` doesn't
+  have. `mvn verify` is the test gate.
+- **Non-root:** user `app`, uid 10001. The chart also sets `runAsNonRoot`, a read-only root
+  filesystem (with an `emptyDir` on `/tmp` for Tomcat), no privilege escalation, and drops all
+  capabilities.
+- **JVM memory:** `-XX:MaxRAMPercentage=60 -XX:InitialRAMPercentage=40 -XX:+ExitOnOutOfMemoryError`
+  in `JAVA_TOOL_OPTIONS`.
+  - A percentage instead of `-Xmx` follows whatever memory limit the chart sets, so the heap tracks
+    the limit without editing the image.
+  - The other 40% is for everything that isn't heap. `ExitOnOutOfMemoryError`: a JVM that has hit OOM
+    is in an unknown state. Exiting lets Kubernetes restart it cleanly.
+  - **It started at 75%, and gateway-api was OOM-killed under load** (see
+    [Found on Kubernetes: 75% heap OOM-kills the gateway](#found-on-kubernetes-75-heap-oom-kills-the-gateway)).
+- **Exec-form `ENTRYPOINT`,** so `java` is PID 1 and receives SIGTERM directly. Spring then shuts
+  down gracefully: it stops taking requests and finishes the Kafka batch.
+
+### The chart
+- **One template for the four apps.** `templates/_app.tpl` renders Deployment + Service +
+  ServiceMonitor. `gateway-api.yaml` etc. are one line each, passing that app's values block. Four
+  copies of the same 150 lines would drift apart.
+- **Config:** one ConfigMap with the connection settings (`DB_URL`, `REDIS_HOST`,
+  `KAFKA_BOOTSTRAP_SERVERS`, `BANK_URL`, `GATEWAY_URL`, `DEMO_WEBHOOK_URL`, ...), and one Secret
+  (`DB_PASSWORD`, `ADMIN_PASSWORD`, `INTERNAL_SERVICE_TOKEN`).
+  - Every app gets both through `envFrom` and reads what its `application.yml` refers to. No app
+    code changed, because every setting was already an environment variable with a local default.
+  - App-specific knobs (bank rates, `FAIL_RATE`) are per-app `env`.
+  - `checksum/config` and `checksum/secret` annotations roll the pods when either changes, because
+    environment variables are only read at start.
+- **Secrets:** on kind the chart creates the Secret from dev values. `secrets.existingSecret` skips
+  that, so on EKS the Secret comes from outside Helm (e.g. AWS Secrets Manager via External Secrets)
+  and never sits in a values file.
+- **Init container `wait-for-dependencies`** (busybox `nc -z`) holds each app until its in-cluster
+  dependencies accept connections. Without it a fresh install crash-loops for a minute while
+  Postgres and Kafka start. That isn't wrong, but it's noisy and slow, because back-off doubles each
+  time. Managed services are not waited for.
+- **Replicas spread over the workers** with a soft `topologySpreadConstraint` (`ScheduleAnyway`).
+  The 2 gateway pods land on different nodes, but scheduling is never blocked.
+
+### Probes
+| Probe | Path | Why |
+|---|---|---|
+| startup | `/actuator/health/liveness`, up to 30 × 5 s | Start under a CPU limit took 11–15 s on kind (0.5–1 CPU), longer on a busy node. Liveness would kill a slow start. |
+| liveness | `/actuator/health/liveness` | "Is the process wedged?" Only the app's own state, never a dependency. |
+| readiness | `/actuator/health/readiness` | "Should traffic come here?" gateway-api adds `db` to this group. |
+
+- **`timeoutSeconds: 2`** on every probe instead of the default 1 s. A JIT-cold JVM under a CPU
+  limit sometimes took over a second to answer its first probes.
+- **The database is in gateway-api's readiness, never in liveness.** If Postgres goes down, the
+  gateway pods become unready (no traffic, a clean 503 at the Ingress) but are not restarted.
+  Restarting every pod because of a dependency outage turns one outage into two, because they all
+  come back together and stampede the database.
+- Redis stays out of readiness, like it stays out of health (`management.health.redis.enabled=false`):
+  the rate limiter fails open.
+- Kafka stays out too: the outbox keeps writes safe in Postgres and the relay catches up.
+
+### Scaling: HPA on gateway-api only
+`autoscaling/v2`, CPU 70% of the request (250m), 2–6 replicas. metrics-server is installed by
+`kind-up.sh`, because kind has none and the HPA would show `<unknown>`. On kind it needs
+`--kubelet-insecure-tls`, since kind's kubelets have self-signed certificates.
+
+Why gateway-api can scale:
+- the outbox relay uses `FOR UPDATE SKIP LOCKED`, so relays on N pods split the backlog without
+  double-publishing ([Outbox](#outbox));
+- the reconciler takes each payment's idempotency-key lock, so two pods never drive one payment;
+- rate limits live in Redis, so the limit is per merchant, not per merchant per pod;
+- Flyway takes a Postgres advisory lock, so two pods starting together don't both migrate.
+
+What does **not** scale:
+- **mock-bank is pinned to 1.** It keeps charges in memory, and the reconciler asks it "what
+  happened to payment X?". With 2 replicas, the second pod has never heard of the charge.
+- **webhook-dispatcher stays at 1** for the demo. It could scale up to the 6 partitions of
+  `payment.events` (Kafka gives each consumer in the group its own partitions), but CPU is the wrong
+  signal for it: consumer lag is. That would need KEDA or a custom metric, which is out of scope.
+
+### Stateful services: in-cluster, demo only
+Postgres 16, Redis 7 and Kafka (apache/kafka 3.9.1, KRaft, single node) run as one-replica
+StatefulSets with headless Services.
+- **Postgres:** `PGDATA` is a subdirectory of the volume, because an EBS volume's root has
+  `lost+found`, which `initdb` refuses. Kafka's log dir is a subdirectory for the same reason.
+- **Redis has no volume.** It only holds token buckets, which refill within seconds, and the
+  limiter fails open.
+- **Kafka advertises its Service name** (`ledgerline-kafka:9092`), like compose advertises `kafka:29092`.
+  - The headless Service sets `publishNotReadyAddresses: true`. Otherwise the name resolves only
+    after the pod is Ready. The broker's own readiness probe connects through that name, so the pod
+    would never become Ready.
+  - `enableServiceLinks: false` stops Kubernetes from injecting `*_PORT=tcp://…` variables into the
+    pod, because the image turns `KAFKA_*` environment variables into broker config.
+- **Production would use managed services:** Amazon RDS for Postgres (Multi-AZ, automated backups,
+  point-in-time recovery), ElastiCache for Redis, and MSK for Kafka (3 brokers, replication factor 3,
+  `min.insync.replicas=2`). A single Kafka pod on one EBS volume is one node failure away from
+  losing `payment.events`.
+  - The chart already supports the switch: `postgres.enabled=false` + `external.databaseUrl`, and
+    the same for Redis and Kafka.
+
+### values-eks.yaml is scaffolding for EKS in Phase 8
+It renders and installs: ECR image repository, `gp3` storage, `existingSecret`, bigger requests. But
+it **still runs the in-cluster StatefulSets**, only because no Terraform exists yet to create RDS,
+ElastiCache and MSK. That is **not** the intended EKS architecture. Phase 9 (Terraform) switches
+the EKS deployment to the managed services with `*.enabled=false` and `external.*`. A commented block
+at the bottom of `values-eks.yaml` shows the exact values, including `kafkaReplicationFactor: 3`.
+- Images built on an Apple Silicon laptop are arm64. EKS EC2 nodes are usually amd64, so push with
+  `docker buildx build --platform linux/amd64` (or run Graviton nodes).
+
+### The demo merchants' webhook URL: one-time seed configuration
+V3 seeded the three demo merchants with `http://localhost:8083/webhooks`. That's right when the apps
+run on the host, but in a pod `localhost` is the dispatcher itself, so every webhook would fail.
+- **The fix:** `V6__demo_webhook_url.sql` rewrites that URL to the Flyway placeholder
+  `${demo_webhook_url}`, which is set from `DEMO_WEBHOOK_URL`. The default is the old localhost value,
+  so compose and `make run-all` are unchanged. The chart sets it to
+  `http://ledgerline-demo-merchant:8083/webhooks`.
+- **It is one-time seed configuration, not live config.** Flyway applies V6 once per database and
+  records it in `flyway_schema_history`. Changing `DEMO_WEBHOOK_URL` later does **not** change a
+  database that has already been migrated. Only a fresh database gets the value, at its first
+  migration: a new kind cluster, a new RDS instance. To change it on an existing database, recreate
+  the database (on kind: `make kind-down`, or delete the Postgres PVC) or `UPDATE merchants`
+  by hand. `DemoWebhookUrlMigrationIT` tests both halves:
+  - a fresh database gets the configured URL;
+  - migrating again with a different value changes nothing.
+- **Why not a Helm hook Job running `UPDATE`:** it would run on every upgrade, need `psql` and the
+  DB password in yet another pod, and put schema-adjacent data changes outside Flyway's history.
+- **Why not a real "merchant settings" API:** merchants can't change their webhook URL yet. When
+  they can, this migration becomes irrelevant.
+
+### Ingress
+ingress-nginx runs on the control-plane node (label `ingress-ready=true`) with `hostPort` 80/443,
+which kind maps to the laptop.
+- `api.localtest.me` → gateway-api. `localtest.me` is a public DNS name whose every subdomain
+  resolves to 127.0.0.1, so there are no `/etc/hosts` edits.
+- Only gateway-api is exposed. The dispatcher, bank and merchant are cluster-internal.
+- **Grafana's Ingress comes from the kube-prometheus-stack values, not this chart,** because an
+  Ingress can only route to Services in its own namespace and Grafana lives in `monitoring`.
+- **ingress-nginx was retired in March 2026** and gets no more releases or security fixes. It's fine
+  for a laptop demo. A real cluster would use the Gateway API, or on EKS the AWS Load Balancer
+  Controller (ALB).
+
+### Monitoring: kube-prometheus-stack
+- **ServiceMonitors** (one per app, from `_app.tpl`) tell the Prometheus Operator to scrape
+  `/actuator/prometheus` on every pod behind the Service, every 15 s. New gateway pods from the HPA
+  are picked up automatically, which static `prometheus.yml` targets can't do.
+  - `serviceMonitorSelectorNilUsesHelmValues: false` makes Prometheus select ServiceMonitors in every
+    namespace, not only those labelled with its own Helm release. So the ledgerline chart needs no
+    knowledge of how monitoring was installed.
+- **The dashboard** is a ConfigMap labelled `grafana_dashboard: "1"`, from
+  `dashboards/ledgerline-dashboard.json`. That file moved there from `infra/grafana/` because
+  `.Files.Get` can only read inside the chart; docker-compose mounts the new path. The Grafana
+  sidecar watches every namespace (`searchNamespace: ALL`), so it loads the dashboard.
+- **The datasource uid is pinned, and checked.** The dashboard refers to its datasource by uid
+  `prometheus`.
+  - `kube-prometheus-stack-values.yaml` sets `grafana.sidecar.datasources.uid: prometheus`
+    explicitly, instead of relying on the chart's default. The chart version is pinned in
+    `kind-up.sh`.
+  - After installing, `kind-up.sh` calls `GET /api/datasources/uid/prometheus` through the Ingress
+    and exits with an error unless the response has `"uid":"prometheus"`. A future chart that
+    renamed it would fail the bring-up, not quietly show empty panels.
+- The dashboard filters on the `application` tag, which each app sets itself, not on Prometheus'
+  `job` label. So the same JSON works for compose's static targets and for ServiceMonitors.
+- Alertmanager is off: there are no alert rules yet.
+
+### kind-up.sh
+- **Idempotent:** it skips cluster creation if the cluster exists and uses
+  `helm upgrade --install` everywhere.
+- **Image tags are the git short SHA** (plus `-dirty-<timestamp>` for uncommitted changes).
+  - Images are loaded with `kind load docker-image` and `pullPolicy: Never`. Re-using the tag `dev`
+    would make `helm upgrade` a no-op, and the old code would keep running.
+  - A new tag changes the pod spec, so the Deployment rolls.
+- **Chart versions are pinned:** ingress-nginx 4.15.1, metrics-server 3.14.0,
+  kube-prometheus-stack 91.8.1.
+- **Memory preflight.** Before creating the cluster, the script warns if Docker has less than ~6 GB
+  available. The first run shared a 12 GB Docker VM with 9 GB of other containers. The node
+  containers swapped, the API server restarted, and helm failed with "client connection lost" and
+  an RBAC "forbidden" error. Nothing in those errors says "out of memory", hence the explicit check.
+
+### Found on Kubernetes: consumers pinning the only carrier
+The first kind run put webhook-dispatcher in a restart loop. The other three apps were fine.
+- **Symptom:** the app logged "Started" in 6–11 s, then its startup, liveness and readiness probes
+  timed out for 45 s to 2 min after every start. Kubernetes killed it, and the loop repeated. CPU
+  was about 10m, so it wasn't starved. Health answered in 6 ms once it was stable.
+- **Why only there:** the pod has a 1-CPU limit, so `nproc` is 1 and the JVM's virtual-thread
+  scheduler has one carrier. On the laptop it has 8.
+- **Evidence:**
+  - A thread dump (`kill -3 1`, since the JRE image has no `jcmd`) taken while `/actuator/health`
+    hung showed the carriers busy with virtual threads and Tomcat's request never scheduled.
+  - `-Djdk.tracePinnedThreads=full` printed pinned stacks in `AbstractCoordinator.joinGroupIfNeeded`,
+    `ensureCoordinatorReady`, `maybeLeaveGroup` and `resetStateAndRejoin`. They are all `synchronized`
+    and hold the monitor across the network wait.
+  - The window matches a rebalance: the killed pod's 18 consumers stay in the group until their
+    session times out, and until then the new pod's consumers wait in `JoinGroup`.
+- **What didn't fix it:** `-Djdk.virtualThreadScheduler.parallelism=4`. 18 consumers can pin more
+  carriers than that.
+- **Fix:** a `ContainerCustomizer` gives every listener container (main, retry topics, DLT) a
+  platform-thread `SimpleAsyncTaskExecutor` named `kafka-consumer-`. Webhook HTTP calls and requests
+  stay on virtual threads.
+  - Afterwards, 60 health checks at 1 s intervals right after a restart were all under 1 s, with no
+    restarts.
+  - `ConsumerThreadsIT` asserts that every container's executor runs on platform threads.
+- **Lesson:** a virtual-thread problem that is invisible with 8 cores can be fatal with 1. Test under
+  the CPU limit you deploy with. JDK 24 (JEP 491) removes this particular `synchronized` pinning.
+
+### Found on Kubernetes: 75% heap OOM-kills the gateway
+The first k6 run on kind (`steady.js`, 200 req/s through the Ingress) failed. 97% of requests
+errored, and 4 of 6 gateway pods were `OOMKilled` (exit 137) at the 768 Mi limit.
+- **Why:** 75% of 768 Mi is a 576 MB heap. What the JVM needs *outside* the heap, measured through
+  `/actuator/prometheus` on the running pods (committed non-heap = metaspace + code cache + class space):
+
+  | App | Non-heap committed | Live threads | RSS at rest |
+  |---|---|---|---|
+  | gateway-api | 158–200 MB | 31–37 | 451–711 MB |
+  | webhook-dispatcher | 117 MB | 93 | 443 MB |
+  | mock-bank | 88 MB | 19 | 378 MB |
+  | demo-merchant | 82 MB | 18 | 353 MB |
+
+  On top of that come thread stacks, GC data structures, direct buffers and malloc arenas. At rest the
+  gateway had 414 MB of heap committed and 711 MB RSS. Under load the heap grows toward its 576 MB
+  max, and 576 + ~300 MB is more than 768 Mi, so the kernel kills it. That kill comes from the kernel,
+  not a Java `OutOfMemoryError`, so `ExitOnOutOfMemoryError` never runs.
+- **Fix:**
+  - `MaxRAMPercentage=60` in all four images. That leaves 40% of the limit, at least ~200 MB in the
+    smallest (512 Mi) container, which covers what was measured.
+  - gateway-api goes to 1 Gi (request 768 Mi), so its heap is ~614 MB with ~410 MB of headroom.
+- **Why a percentage still, not `-Xmx`:** the rule "heap = 60% of the limit" keeps working when
+  values-eks raises the limits. An `-Xmx` in the image would silently stop matching.
+- **What held up:** the pods died mid-transaction dozens of times, and afterwards
+  `/admin/ledger/verify` was consistent (every entry balanced, `globalNet` 0), with no payment left
+  PENDING or UNKNOWN. The one-transaction ledger + outbox design did what it's for. k6 counted 721
+  accepted payments while Postgres had 3,639 CAPTURED. Many requests completed on the server after
+  the client had given up, which is exactly why clients retry with the same `Idempotency-Key`.
+- The JVM also picked **SerialGC**, because it sees 1 CPU and less than 1792 MB. That is fine at
+  this size: pauses are short with a small heap. Larger pods on EKS (2 CPUs) get G1 automatically.
+
+### Testing
+- `DemoWebhookUrlMigrationIT` (Testcontainers Postgres, Flyway run directly): a fresh database gets
+  the configured URL, and a second migrate with another value changes nothing.
+  `GatewayApiApplicationIT` now expects schema version 6.
+- `ConsumerThreadsIT` (dispatcher): every listener container's executor runs tasks on platform threads.
+- `helm lint` and `helm template` pass for `values-kind.yaml` and `values-eks.yaml`, and also with
+  the EKS managed-service switch (`*.enabled=false` + `external.*`), where the gateway correctly gets
+  no wait-for init container.
+- Checked by hand on kind (`make kind-up`):
+  - all pods Ready, and the 2 gateway replicas on different workers;
+  - `POST /v1/payments` through `api.localtest.me` is CAPTURED, demo-merchant logs the verified
+    `payment.captured` webhook about 1 s later, and `/admin/ledger/verify` is consistent;
+  - `merchants.webhook_url` is the in-cluster URL, and Flyway is at version 6;
+  - Prometheus has all 5 app pods `up` through the ServiceMonitors;
+  - Grafana has datasource uid `prometheus`, the Ledgerline dashboard (20 panels) is the home page,
+    and a query through the datasource returns series for all 4 apps;
+  - a second `kind-up.sh` on the existing cluster finishes in about 2 minutes and rolls the apps to
+    the new image tag.

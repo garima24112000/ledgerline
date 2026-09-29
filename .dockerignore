@@ -1,0 +1,8 @@
+# Only poms and src/ are needed by the Dockerfiles; keep the build context small.
+.git
+**/target
+infra
+docs
+logs
+scripts
+*.md

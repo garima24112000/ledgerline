@@ -84,7 +84,7 @@ services:
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/ledgerline-dashboard.json
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./grafana/ledgerline-dashboard.json:/var/lib/grafana/dashboards/ledgerline-dashboard.json:ro
+      - ./helm/ledgerline/dashboards/ledgerline-dashboard.json:/var/lib/grafana/dashboards/ledgerline-dashboard.json:ro
     depends_on:
       prometheus:
         condition: service_healthy

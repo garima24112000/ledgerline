@@ -1,0 +1,1 @@
+{{- include "ledgerline.app" (dict "root" $ "component" "webhook-dispatcher" "app" .Values.webhookDispatcher) }}

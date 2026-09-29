@@ -1,0 +1,142 @@
+# Defaults for the Ledgerline chart. values-kind.yaml and values-eks.yaml override per environment.
+
+# Images are <repository>/<app>:<tag>, e.g. ledgerline/gateway-api:dev.
+image:
+  repository: ledgerline
+  tag: dev
+  pullPolicy: IfNotPresent
+
+# Shared, non-secret settings. Each app reads only the variables it knows about.
+config:
+  kafkaReplicationFactor: 1 # 1 for the single in-cluster broker; 3 on MSK
+  # Written into the database ONCE, by Flyway migration V6, when the database is first migrated.
+  # Changing it on an existing database has no effect: recreate the database or UPDATE merchants by hand.
+  # Empty = the in-cluster demo-merchant Service.
+  demoWebhookUrl: ""
+
+# DB_PASSWORD, ADMIN_PASSWORD, INTERNAL_SERVICE_TOKEN for every app.
+secrets:
+  # Name of a Secret created outside this chart (e.g. synced from AWS Secrets Manager). When set,
+  # the values below are ignored and the chart creates no Secret.
+  existingSecret: ""
+  dbPassword: ""
+  adminPassword: ""
+  internalServiceToken: ""
+
+# ---------------------------------------------------------------------------------------------
+# Apps. Each one is a Deployment + Service (+ ServiceMonitor), rendered by templates/_app.tpl.
+#   waitFor: dependencies an init container waits for (TCP connect) before the app starts.
+#            Only in-cluster ones are waited for; managed services (RDS, ...) are assumed up.
+#   env:     extra environment variables for this app only.
+# ---------------------------------------------------------------------------------------------
+gatewayApi:
+  port: 8080
+  replicas: 2 # ignored when the HPA is enabled
+  waitFor: [postgres, redis, kafka]
+  env:
+    # Not ready while the database is down, so the Service stops sending it traffic.
+    # (Liveness never checks the database: a DB outage must not restart every pod.)
+    MANAGEMENT_ENDPOINT_HEALTH_GROUP_READINESS_INCLUDE: readinessState,db
+  # Heap is 60% of the limit (~614 MB). Measured outside the heap: ~160-200 MB metaspace + code cache,
+  # plus thread stacks and native memory. At 768 Mi it was OOM-killed under load.
+  resources:
+    requests: { cpu: 250m, memory: 768Mi }
+    limits: { cpu: "1", memory: 1Gi }
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+
+webhookDispatcher:
+  port: 8081
+  replicas: 1
+  waitFor: [kafka, gateway-api]
+  env: {}
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { cpu: "1", memory: 768Mi }
+
+mockBank:
+  port: 8082
+  # Always 1: charges live in memory, and the reconciler relies on the bank remembering them.
+  replicas: 1
+  waitFor: []
+  env:
+    BANK_APPROVE_RATE: "0.85"
+    BANK_DECLINE_RATE: "0.10"
+    BANK_TIMEOUT_RATE: "0.05"
+    BANK_TIMEOUTS_ENABLED: "true"
+  resources:
+    requests: { cpu: 100m, memory: 384Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+
+demoMerchant:
+  port: 8083
+  replicas: 1
+  waitFor: []
+  env:
+    FAIL_RATE: "0.0"
+  resources:
+    requests: { cpu: 100m, memory: 384Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+
+# Probes shared by all apps (Spring Boot actuator health groups).
+probes:
+  # The startup probe covers JVM + Spring start under a CPU limit (up to 30 x 5s); liveness and
+  # readiness only begin once it has passed, so a slow start is never mistaken for a hang.
+  # timeoutSeconds 2, not the default 1: a JIT-cold JVM under a CPU limit can take >1s to answer.
+  startup: { periodSeconds: 5, failureThreshold: 30, timeoutSeconds: 2 }
+  liveness: { periodSeconds: 10, failureThreshold: 3, timeoutSeconds: 2 }
+  readiness: { periodSeconds: 5, failureThreshold: 3, timeoutSeconds: 2 }
+
+ingress:
+  enabled: true
+  className: nginx
+  host: api.localtest.me
+
+serviceMonitor:
+  enabled: true # needs the Prometheus Operator CRDs (kube-prometheus-stack)
+  interval: 15s
+
+grafanaDashboard:
+  enabled: true # ConfigMap picked up by the Grafana sidecar (label grafana_dashboard: "1")
+
+# ---------------------------------------------------------------------------------------------
+# In-cluster stateful services. Fine for a demo; production uses RDS, ElastiCache and MSK.
+# Set <name>.enabled=false and fill in external.* to point at a managed service instead.
+# ---------------------------------------------------------------------------------------------
+external:
+  databaseUrl: ""           # jdbc:postgresql://<rds-endpoint>:5432/ledgerline
+  redisHost: ""             # <elasticache-endpoint>
+  kafkaBootstrapServers: "" # <msk-broker-1>:9092,<msk-broker-2>:9092,...
+
+storageClass: "" # "" = the cluster's default StorageClass
+
+postgres:
+  enabled: true
+  image: postgres:16
+  database: ledgerline
+  username: ledgerline
+  storage: 2Gi
+  resources:
+    requests: { cpu: 250m, memory: 256Mi }
+    limits: { memory: 1Gi }
+
+redis:
+  enabled: true
+  image: redis:7
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { memory: 256Mi }
+
+kafka:
+  enabled: true
+  image: apache/kafka:3.9.1
+  # Any fixed base64 UUID; KRaft formats the log directory with it on first start.
+  clusterId: bGVkZ2VybGluZS1rYWZrYQ
+  storage: 4Gi
+  heapOpts: "-Xms512m -Xmx512m"
+  resources:
+    requests: { cpu: 250m, memory: 1Gi }
+    limits: { memory: 1536Mi }

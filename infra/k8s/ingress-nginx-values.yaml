@@ -1,0 +1,23 @@
+# ingress-nginx on kind (chart version pinned in scripts/kind-up.sh).
+# The controller runs on the control-plane node, which kind-config.yaml labels ingress-ready=true
+# and whose ports 80/443 are mapped to the laptop. hostPort binds the controller straight to them.
+#
+# Note: the ingress-nginx project was retired in March 2026 (no further releases or security fixes).
+# Fine for a local demo; a real cluster would use the Gateway API or, on EKS, the AWS Load Balancer Controller.
+controller:
+  hostPort:
+    enabled: true
+  service:
+    type: NodePort
+  nodeSelector:
+    ingress-ready: "true"
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+  ingressClassResource:
+    default: true
+  publishService:
+    enabled: false # status.loadBalancer would otherwise stay empty on NodePort
+  extraArgs:
+    publish-status-address: localhost

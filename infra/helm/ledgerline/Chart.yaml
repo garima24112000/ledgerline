@@ -1,0 +1,6 @@
+apiVersion: v2
+name: ledgerline
+description: Ledgerline mini payment gateway - the four apps plus Postgres, Redis and Kafka for demos
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

@@ -1,0 +1,1 @@
+{{- include "ledgerline.app" (dict "root" $ "component" "gateway-api" "app" .Values.gatewayApi) }}

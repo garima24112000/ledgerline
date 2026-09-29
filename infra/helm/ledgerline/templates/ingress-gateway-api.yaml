@@ -1,0 +1,24 @@
+{{- if .Values.ingress.enabled }}
+{{- $ctx := dict "root" $ "component" "gateway-api" }}
+# Public entry point: only gateway-api is exposed. The dispatcher, bank and merchant stay internal.
+# (Grafana's Ingress comes from kube-prometheus-stack values: it lives in the monitoring namespace.)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "ledgerline.name" $ctx }}
+  labels:
+    {{- include "ledgerline.labels" $ctx | nindent 4 }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "ledgerline.name" $ctx }}
+                port:
+                  name: http
+{{- end }}

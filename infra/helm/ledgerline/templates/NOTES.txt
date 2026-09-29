@@ -1,0 +1,14 @@
+Ledgerline is deploying into namespace {{ .Release.Namespace }}.
+
+  kubectl -n {{ .Release.Namespace }} get pods,hpa
+
+{{- if .Values.ingress.enabled }}
+
+Gateway API:  http://{{ .Values.ingress.host }}/swagger-ui.html
+Health:       http://{{ .Values.ingress.host }}/actuator/health
+{{- end }}
+
+Demo API keys are in README.md. Admin endpoints use basic auth with ADMIN_PASSWORD from the
+{{ include "ledgerline.secretName" . }} Secret.
+
+Webhook deliveries:  kubectl -n {{ .Release.Namespace }} logs deploy/{{ .Release.Name }}-demo-merchant -f

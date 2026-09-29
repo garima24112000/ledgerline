@@ -1,0 +1,21 @@
+{{- $ctx := dict "root" $ "component" "config" -}}
+# Shared, non-secret settings as environment variables; every app gets all of them (envFrom)
+# and reads the ones its application.yml refers to.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-config
+  labels:
+    {{- include "ledgerline.labels" $ctx | nindent 4 }}
+data:
+  DB_URL: {{ include "ledgerline.databaseUrl" . | quote }}
+  DB_USERNAME: {{ .Values.postgres.username | quote }}
+  REDIS_HOST: {{ include "ledgerline.redisHost" . | quote }}
+  REDIS_PORT: "6379"
+  KAFKA_BOOTSTRAP_SERVERS: {{ include "ledgerline.kafkaBootstrapServers" . | quote }}
+  KAFKA_REPLICATION_FACTOR: {{ .Values.config.kafkaReplicationFactor | quote }}
+  BANK_URL: "http://{{ .Release.Name }}-mock-bank:{{ .Values.mockBank.port }}"
+  GATEWAY_URL: "http://{{ .Release.Name }}-gateway-api:{{ .Values.gatewayApi.port }}"
+  # One-time seed configuration: Flyway V6 writes it into merchants.webhook_url when the database is
+  # first migrated. Changing it later does not update an already-migrated database.
+  DEMO_WEBHOOK_URL: {{ .Values.config.demoWebhookUrl | default (printf "http://%s-demo-merchant:%v/webhooks" .Release.Name .Values.demoMerchant.port) | quote }}

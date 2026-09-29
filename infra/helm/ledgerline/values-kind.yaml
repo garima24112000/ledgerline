@@ -1,0 +1,17 @@
+# Local kind cluster (scripts/kind-up.sh). Images are built locally and loaded with
+# `kind load docker-image`, so they must never be pulled from a registry.
+image:
+  repository: ledgerline
+  tag: dev
+  pullPolicy: Never
+
+# Dev-only values, the same defaults the apps use outside Kubernetes. Never reuse them anywhere real.
+secrets:
+  dbPassword: ledgerline
+  adminPassword: admin-dev-password
+  internalServiceToken: dev-internal-service-token
+
+storageClass: standard # kind's local-path provisioner
+
+ingress:
+  host: api.localtest.me # resolves to 127.0.0.1; kind maps host port 80 to ingress-nginx

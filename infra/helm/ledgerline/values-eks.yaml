@@ -1,0 +1,59 @@
+# =============================================================================================
+# EKS - PHASE 8 SCAFFOLDING, NOT THE FINAL EKS ARCHITECTURE.
+#
+# This renders and installs on EKS, but it still runs Postgres, Redis and Kafka as in-cluster
+# StatefulSets, only because the Terraform that creates the managed services doesn't exist yet.
+# Phase 9 (Terraform) switches EKS to Amazon RDS, ElastiCache and MSK: set postgres/redis/kafka
+# .enabled=false and fill in external.* (see the commented block at the bottom).
+# =============================================================================================
+
+# Images pushed to ECR. Build for the node architecture (e.g. docker buildx --platform linux/amd64
+# on an Apple Silicon laptop), then push <repository>/<app>:<tag>.
+image:
+  repository: <account-id>.dkr.ecr.<region>.amazonaws.com/ledgerline
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+# Created outside Helm (e.g. from AWS Secrets Manager with External Secrets), with the keys
+# DB_PASSWORD, ADMIN_PASSWORD, INTERNAL_SERVICE_TOKEN. The chart creates no Secret.
+secrets:
+  existingSecret: ledgerline-secrets
+
+storageClass: gp3 # EBS CSI driver StorageClass
+
+ingress:
+  className: nginx
+  host: api.ledgerline.example.com
+
+gatewayApi:
+  resources:
+    requests: { cpu: 500m, memory: 1Gi }
+    limits: { cpu: "2", memory: 1536Mi }
+  hpa:
+    minReplicas: 2
+    maxReplicas: 6
+
+webhookDispatcher:
+  resources:
+    requests: { cpu: 500m, memory: 1Gi }
+    limits: { cpu: "2", memory: 1536Mi }
+
+postgres:
+  storage: 20Gi
+
+kafka:
+  storage: 20Gi
+
+# --- Phase 9: managed services (uncomment once Terraform creates them) ---------------------------
+# postgres:
+#   enabled: false
+# redis:
+#   enabled: false
+# kafka:
+#   enabled: false
+# external:
+#   databaseUrl: jdbc:postgresql://<rds-endpoint>:5432/ledgerline
+#   redisHost: <elasticache-primary-endpoint>
+#   kafkaBootstrapServers: <msk-broker-1>:9092,<msk-broker-2>:9092,<msk-broker-3>:9092
+# config:
+#   kafkaReplicationFactor: 3

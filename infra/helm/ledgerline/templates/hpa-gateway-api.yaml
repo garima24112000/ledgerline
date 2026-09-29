@@ -1,0 +1,27 @@
+{{- if .Values.gatewayApi.hpa.enabled }}
+{{- $ctx := dict "root" $ "component" "gateway-api" }}
+# Scales gateway-api on CPU. Safe with several replicas: the outbox relay uses FOR UPDATE SKIP LOCKED,
+# the reconciler takes each payment's idempotency-key lock, rate limits are shared through Redis,
+# and Flyway serializes migrations with a Postgres advisory lock.
+# Utilization is measured against the CPU *request*, so the request must be set (it is, in values).
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "ledgerline.name" $ctx }}
+  labels:
+    {{- include "ledgerline.labels" $ctx | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "ledgerline.name" $ctx }}
+  minReplicas: {{ .Values.gatewayApi.hpa.minReplicas }}
+  maxReplicas: {{ .Values.gatewayApi.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.gatewayApi.hpa.targetCPUUtilizationPercentage }}
+{{- end }}

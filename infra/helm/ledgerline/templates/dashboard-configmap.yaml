@@ -1,0 +1,15 @@
+{{- if .Values.grafanaDashboard.enabled }}
+{{- $ctx := dict "root" $ "component" "dashboard" }}
+# The Grafana sidecar (kube-prometheus-stack) loads every ConfigMap labelled grafana_dashboard: "1".
+# Same JSON as docker-compose uses; it queries datasource uid "prometheus".
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ledgerline.name" $ctx }}
+  labels:
+    {{- include "ledgerline.labels" $ctx | nindent 4 }}
+    grafana_dashboard: "1"
+data:
+  ledgerline-dashboard.json: |-
+    {{- .Files.Get "dashboards/ledgerline-dashboard.json" | nindent 4 }}
+{{- end }}

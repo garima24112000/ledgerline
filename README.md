@@ -1,11 +1,24 @@
 # Ledgerline
 
+[![Main pipeline](https://github.com/garima24112000/ledgerline/actions/workflows/deploy.yml/badge.svg?branch=main)](https://github.com/garima24112000/ledgerline/actions/workflows/deploy.yml)
+
+**TL;DR:** Local benchmark: **231 req/s at 176 ms p99 with 0% errors**; **6,000 duplicate requests across 600 idempotency keys produced 600 payments and 0 duplicate payments**; **deployed and verified on AWS EKS + RDS** with Terraform and GitHub Actions OIDC.
+
 A mini payment gateway for small merchants: an idempotent payments API on a double-entry ledger, a
 fake card processor that randomly declines, is slow, or times out, and signed webhooks delivered
 through a transactional outbox and Kafka. It runs locally, on kind, and on AWS (EKS + RDS, deployed
 by GitHub Actions over OIDC).
 
-It's a personal learning project. Every design decision, trade-off and measurement is written up in
+## Why I built it
+
+I built Ledgerline after working on payment integrations at Razorpay and becoming interested in
+the reliability problems hidden behind a seemingly simple payment API. I wanted to build the pieces
+I had interacted with from the integration side: idempotency under concurrency, a double-entry ledger,
+reliable event delivery, retries, rate limiting, observability, and production-style deployment.
+The goal was not just to make a payment request succeed, but to test what happens when requests are
+duplicated, dependencies time out, and the system is pushed past its capacity.
+
+Every design decision, trade-off and measurement is written up in
 [docs/DESIGN.md](docs/DESIGN.md), including [the limit it hits under load](#known-scaling-limits).
 
 ## Highlights

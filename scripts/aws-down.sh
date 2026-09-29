@@ -210,7 +210,10 @@ fi
 
 if command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then
   # Pushes to main no longer try (and fail) to deploy to a stack that doesn't exist.
-  gh variable set DEPLOY_ENABLED --body false >/dev/null 2>&1 && echo "GitHub variable DEPLOY_ENABLED=false" || true
+  # Best effort: a failure here must not fail the teardown.
+  if gh variable set DEPLOY_ENABLED --body false >/dev/null 2>&1; then
+    echo "GitHub variable DEPLOY_ENABLED=false"
+  fi
 fi
 
 # --- Verification: prove nothing chargeable is left ---------------------------------------------------

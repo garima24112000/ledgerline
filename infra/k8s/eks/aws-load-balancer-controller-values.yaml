@@ -1,0 +1,16 @@
+# AWS Load Balancer Controller on EKS (chart version pinned in scripts/aws-up.sh).
+# clusterName, region, vpcId and the IRSA role ARN come from Terraform outputs via --set.
+# It turns the gateway-api Ingress (className alb) into an internet-facing ALB.
+serviceAccount:
+  create: true
+  name: aws-load-balancer-controller # must match the IRSA trust in infra/terraform/eks.tf
+
+# Tags on every ALB, target group and security group the controller creates, so aws-down.sh can
+# prove none are left behind.
+defaultTags:
+  project: ledgerline
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi

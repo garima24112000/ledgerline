@@ -1,0 +1,107 @@
+# Build + all tests (unit and Testcontainers integration tests), chart and Terraform checks.
+# Runs on pull requests and on pushes to any branch except main. On main it runs exactly once, as
+# the first job of deploy.yml (workflow_call), so a commit is never deployed without passing it.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches-ignore: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  verify:
+    name: mvn verify
+    runs-on: ubuntu-latest # has Docker, which Testcontainers needs
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Build and test
+        run: mvn -B -ntp verify
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-reports
+          path: |
+            **/target/surefire-reports/
+            **/target/failsafe-reports/
+          if-no-files-found: warn
+          retention-days: 14
+
+  chart:
+    name: Helm chart
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CHART: infra/helm/ledgerline
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: azure/setup-helm@v5
+        with:
+          version: v3.22.0
+
+      - name: Lint and render (kind)
+        run: |
+          helm lint "$CHART" -f "$CHART/values-kind.yaml"
+          helm template ledgerline "$CHART" -f "$CHART/values-kind.yaml" > /dev/null
+
+      - name: Lint and render (EKS)
+        run: |
+          eks=(-f "$CHART/values-eks.yaml" --set external.databaseUrl=jdbc:postgresql://db:5432/ledgerline
+               --set 'ingress.allowedCidrs={203.0.113.7/32}')
+          helm lint "$CHART" "${eks[@]}"
+          helm template ledgerline "$CHART" "${eks[@]}" > /dev/null
+
+      - name: The EKS render refuses an open or missing source CIDR
+        run: |
+          for cidrs in "" "{0.0.0.0/0}" "{::/0}"; do
+            if helm template x "$CHART" -f "$CHART/values-eks.yaml" --set external.databaseUrl=x \
+                 ${cidrs:+--set "ingress.allowedCidrs=$cidrs"} > /dev/null 2>&1; then
+              echo "::error::values-eks.yaml rendered with ingress.allowedCidrs='$cidrs'"
+              exit 1
+            fi
+          done
+
+  terraform:
+    name: Terraform
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: infra/terraform
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.16.4"
+
+      # No AWS credentials: format, provider download and static validation only.
+      - run: terraform fmt -check -recursive
+      - run: terraform init -backend=false -input=false
+      - run: terraform validate
+
+  scripts:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - run: shellcheck scripts/aws-up.sh scripts/aws-down.sh

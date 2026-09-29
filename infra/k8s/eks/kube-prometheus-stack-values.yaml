@@ -1,0 +1,40 @@
+# kube-prometheus-stack on EKS (chart version pinned in scripts/aws-up.sh). Same scraping and
+# dashboard setup as infra/k8s/kube-prometheus-stack-values.yaml (kind), with these differences:
+#   - no Grafana Ingress: Grafana is reached with kubectl port-forward only, never from the internet;
+#   - Grafana's admin password is random (aws-up.sh passes it with --set; it is printed there);
+#   - aggregate ClusterRoles, so the GitHub deploy role, which is only admin of the ledgerline
+#     namespace, may create the chart's ServiceMonitors (monitoring.coreos.com).
+
+global:
+  rbac:
+    createAggregateClusterRoles: true
+
+prometheus:
+  prometheusSpec:
+    # Select ServiceMonitors in every namespace, not only those labelled with this release.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    scrapeInterval: 15s
+    retention: 2d # emptyDir: metrics are lost if the pod moves; fine for a session-long demo
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+
+alertmanager:
+  enabled: false # the ledger audit alarms live in CloudWatch (infra/terraform/alarms.tf)
+
+grafana:
+  adminUser: admin
+  defaultDashboardsEnabled: true
+  ingress:
+    enabled: false
+  sidecar:
+    datasources:
+      uid: prometheus # the Ledgerline dashboard refers to its datasource by this uid
+    dashboards:
+      searchNamespace: ALL
+  grafana.ini:
+    dashboards:
+      default_home_dashboard_path: /tmp/dashboards/ledgerline-dashboard.json

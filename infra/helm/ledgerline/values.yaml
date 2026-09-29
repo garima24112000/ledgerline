@@ -93,7 +93,12 @@ probes:
 ingress:
   enabled: true
   className: nginx
-  host: api.localtest.me
+  host: api.localtest.me # "" = any host
+  annotations: {}
+  # Source IPs allowed to reach the Ingress (list, or comma-separated string). Empty = no restriction.
+  allowedCidrs: []
+  # true = refuse to render without allowedCidrs, or with 0.0.0.0/0 (values-eks.yaml: HTTP-only public ALB).
+  requireAllowedCidrs: false
 
 serviceMonitor:
   enabled: true # needs the Prometheus Operator CRDs (kube-prometheus-stack)

@@ -2,7 +2,7 @@ COMPOSE := docker compose -f infra/docker-compose.yml
 APPS    := gateway-api webhook-dispatcher mock-bank demo-merchant
 PORTS   := 8080 8081 8082 8083
 
-.PHONY: up down build test check-ports run-all grafana seed-payments explain-payments explain-outbox kind-up kind-down
+.PHONY: up down build test check-ports run-all grafana seed-payments explain-payments explain-outbox explain-audit kind-up kind-down aws-up aws-down
 
 up: ## Start Postgres, Redis, Kafka, Prometheus and Grafana; waits until all are healthy
 	$(COMPOSE) up -d --wait
@@ -52,8 +52,17 @@ explain-payments: ## EXPLAIN ANALYZE the payment list query with and without its
 explain-outbox: ## EXPLAIN ANALYZE the outbox relay query with and without its index (seeds and rolls back)
 	$(COMPOSE) exec -T postgres psql -U ledgerline -d ledgerline -f - < infra/scripts/explain-outbox.sql
 
+explain-audit: ## EXPLAIN ANALYZE the four ledger-audit Lambda queries (seeds UNKNOWN payments and rolls back)
+	$(COMPOSE) exec -T postgres psql -U ledgerline -d ledgerline -f - < infra/scripts/explain-audit.sql
+
 kind-up: ## Run everything on a local kind cluster (ingress, metrics-server, kube-prometheus-stack, chart)
 	scripts/kind-up.sh
 
 kind-down: ## Delete the kind cluster and its volumes
 	scripts/kind-down.sh
+
+aws-up: ## Terraform + EKS add-ons + secrets in us-east-1 (COSTS MONEY; see docs/DEPLOY.md)
+	scripts/aws-up.sh
+
+aws-down: ## Destroy everything in AWS and verify nothing chargeable is left
+	scripts/aws-down.sh

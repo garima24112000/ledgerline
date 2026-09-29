@@ -1,0 +1,18 @@
+# gp3 EBS volumes through the EBS CSI driver (EKS add-on, infra/terraform/eks.tf).
+# Deliberately NOT the default StorageClass: values-eks.yaml asks for "gp3" by name (only Kafka's volume
+# uses it), and scripts/aws-up.sh never touches whichever class the cluster already marks as default.
+# StorageClass parameters are immutable: aws-up.sh applies this only when no "gp3" exists yet.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  encrypted: "true"
+  # Tag the EBS volumes the driver creates, so aws-down.sh's leftover check finds them by project.
+  tagSpecification_1: "project=ledgerline"
+# Create the volume in the AZ where the pod is scheduled, not in a random one.
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Delete # deleting the PVC deletes the EBS volume (aws-down.sh relies on this)
+allowVolumeExpansion: true

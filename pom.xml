@@ -23,6 +23,8 @@
         <module>webhook-dispatcher</module>
         <module>mock-bank</module>
         <module>demo-merchant</module>
+        <!-- Plain Java, no Spring: its pom deliberately has no parent (see ledger-audit-lambda/pom.xml). -->
+        <module>ledger-audit-lambda</module>
     </modules>
 
     <properties>

@@ -38,7 +38,23 @@ make kind-down   # delete the cluster
 - `kubectl -n ledgerline get pods,hpa`, and `kubectl -n ledgerline logs deploy/ledgerline-demo-merchant -f` for webhooks
 
 The `curl` examples below work against the cluster too, if you replace `localhost:8080` with `api.localtest.me`.
-For EKS, `infra/helm/ledgerline/values-eks.yaml` is only scaffolding for now (see DESIGN.md, Kubernetes).
+Debugging commands (logs, exec, jcmd, network tools, psql): [docs/RUNBOOK.md](docs/RUNBOOK.md).
+
+## Run it on AWS (EKS + RDS)
+
+Terraform in `infra/terraform` creates a VPC, EKS (3 × c7i-flex.large), RDS PostgreSQL 16, ECR, an S3 bucket,
+the nightly ledger-audit Lambda and a GitHub OIDC deploy role in us-east-1. GitHub Actions
+(`.github/workflows/deploy.yml`) builds linux/amd64 images and deploys with Helm.
+**It costs about $0.21 per hour while it exists, plus the EC2 cost of the 3 nodes** (see
+[DEPLOY.md](docs/DEPLOY.md#costs); free-tier usage or account credits may cover part of the EC2 portion).
+
+```bash
+make aws-up      # scripts/aws-up.sh: terraform apply + cluster add-ons + secrets (asks first)
+make aws-down    # scripts/aws-down.sh: destroy everything, then verify nothing chargeable is left
+```
+
+Prerequisites, GitHub variables, first deploy, redeploy, teardown and common failures:
+[docs/DEPLOY.md](docs/DEPLOY.md).
 
 ## Observability
 

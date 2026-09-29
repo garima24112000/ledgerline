@@ -27,3 +27,7 @@ logs/
 
 # OS
 .DS_Store
+
+# Terraform inputs (contain your IP; see infra/terraform/terraform.tfvars.example)
+*.tfvars
+!*.tfvars.example

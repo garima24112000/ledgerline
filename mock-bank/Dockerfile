@@ -11,6 +11,7 @@ COPY gateway-api/pom.xml gateway-api/
 COPY webhook-dispatcher/pom.xml webhook-dispatcher/
 COPY mock-bank/pom.xml mock-bank/
 COPY demo-merchant/pom.xml demo-merchant/
+COPY ledger-audit-lambda/pom.xml ledger-audit-lambda/
 COPY mock-bank/src mock-bank/src
 # The cache mount keeps ~/.m2 between builds, so the four images share one download of dependencies.
 # Tests run in `mvn verify` (Testcontainers needs a Docker daemon, which a build doesn't have).

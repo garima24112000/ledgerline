@@ -1843,7 +1843,7 @@ chart is meant to deploy to EKS later.
 | Images | `<module>/Dockerfile` (one per app), `.dockerignore` |
 | Cluster | `infra/k8s/kind-config.yaml`: 1 control plane (runs ingress-nginx, ports 80/443 mapped to the laptop) + 2 workers |
 | Chart | `infra/helm/ledgerline`: 4 apps, Postgres/Redis/Kafka StatefulSets, HPA, Ingress, ServiceMonitors, dashboard ConfigMap |
-| Environments | `values-kind.yaml`, `values-eks.yaml` (scaffolding only, see below) |
+| Environments | `values-kind.yaml`, `values-eks.yaml` (EKS + RDS since Phase 9, see [AWS (Phase 9)](#aws-phase-9)) |
 | Monitoring | kube-prometheus-stack, `infra/k8s/kube-prometheus-stack-values.yaml` |
 | Bring-up | `scripts/kind-up.sh`: cluster → images → `kind load` → ingress-nginx → metrics-server → kube-prometheus-stack → chart → datasource check |
 
@@ -1964,14 +1964,14 @@ StatefulSets with headless Services.
   - The chart already supports the switch: `postgres.enabled=false` + `external.databaseUrl`, and
     the same for Redis and Kafka.
 
-### values-eks.yaml is scaffolding for EKS in Phase 8
-It renders and installs: ECR image repository, `gp3` storage, `existingSecret`, bigger requests. But
-it **still runs the in-cluster StatefulSets**, only because no Terraform exists yet to create RDS,
-ElastiCache and MSK. That is **not** the intended EKS architecture. Phase 9 (Terraform) switches
-the EKS deployment to the managed services with `*.enabled=false` and `external.*`. A commented block
-at the bottom of `values-eks.yaml` shows the exact values, including `kafkaReplicationFactor: 3`.
-- Images built on an Apple Silicon laptop are arm64. EKS EC2 nodes are usually amd64, so push with
-  `docker buildx build --platform linux/amd64` (or run Graviton nodes).
+### values-eks.yaml was scaffolding for EKS in Phase 8
+In Phase 8 it rendered and installed (ECR image repository, `gp3` storage, `existingSecret`, bigger
+requests), but it **still ran all three stateful services in-cluster**, because no Terraform existed
+yet. The Phase 8 note said Phase 9 would switch to RDS, ElastiCache *and* MSK. **Phase 9 switched
+only Postgres to RDS.** Redis and Kafka stay in-cluster on EKS, and that part remains demo
+scaffolding. See [AWS (Phase 9)](#aws-phase-9) for why.
+- Images built on an Apple Silicon laptop are arm64, and the EKS nodes are amd64. Since Phase 9, images
+  for EKS are built only by `deploy.yml` on GitHub's amd64 runners (`--platform linux/amd64`).
 
 ### The demo merchants' webhook URL: one-time seed configuration
 V3 seeded the three demo merchants with `http://localhost:8083/webhooks`. That's right when the apps
@@ -2117,3 +2117,390 @@ errored, and 4 of 6 gateway pods were `OOMKilled` (exit 137) at the 768 Mi limit
     and a query through the datasource returns series for all 4 apps;
   - a second `kind-up.sh` on the existing cluster finishes in about 2 minutes and rolls the apps to
     the new image tag.
+
+## AWS (Phase 9)
+
+Terraform, EKS, RDS, a ledger-audit Lambda, and GitHub Actions CI/CD, all in **us-east-1** (AZs us-east-1a and us-east-1b). The
+stack is built to be brought up for a session and torn down completely afterwards.
+
+| Piece | Where |
+|---|---|
+| Infrastructure | `infra/terraform/` (local state): VPC, EKS, RDS, ECR, S3, SSM, Lambda + Scheduler + alarms, GitHub OIDC role |
+| Cluster add-ons and RBAC | `infra/k8s/eks/`: gp3 StorageClass, LB controller values, kube-prometheus-stack values, deployer RoleBinding |
+| Bring-up / teardown | `scripts/aws-up.sh`, `scripts/aws-down.sh` (`make aws-up` / `make aws-down`) |
+| CI / CD | `.github/workflows/ci.yml`, `.github/workflows/deploy.yml` |
+| Audit Lambda | `ledger-audit-lambda/` (plain Java 21) |
+| How-to | [DEPLOY.md](DEPLOY.md), [RUNBOOK.md](RUNBOOK.md) |
+
+```mermaid
+flowchart LR
+    you([your IP /32]) -->|HTTP| alb[ALB<br/>LB controller]
+    subgraph vpc[VPC 10.0.0.0/16, 2 AZs]
+      subgraph pub[public subnets]
+        alb
+        nat[NAT gateway x1]
+      end
+      subgraph priv[private subnets]
+        subgraph eks[EKS: 3 x c7i-flex.large]
+          gw[gateway-api x2-4] --> rd[(redis-0)]
+          gw --> kf[(kafka-0, gp3 EBS)]
+          kf --> wd[webhook-dispatcher] --> dm[demo-merchant]
+          gw --> bank[mock-bank]
+        end
+        rds[(RDS PostgreSQL 16<br/>db.t4g.micro)]
+        lambda[ledger-audit Lambda]
+      end
+    end
+    alb --> gw
+    gw -->|5432, node SG| rds
+    lambda -->|5432, Lambda SG| rds
+    sched[EventBridge Scheduler<br/>02:00 New York] --> lambda
+    lambda -->|audits/YYYY-MM-DD.json| s3[(S3)]
+    lambda -. EMF metric .-> cw[CloudWatch alarms -> SNS]
+    gha[GitHub Actions<br/>main only, OIDC] -->|images| ecr[(ECR)]
+    gha -->|helm upgrade| eks
+    gha -->|update-function-code| lambda
+```
+
+### Only Postgres became managed: Redis and Kafka stay in-cluster
+Phase 8 said Phase 9 would switch to RDS, ElastiCache *and* MSK. The Phase 9 scope (and CLAUDE.md's
+AWS list) has **only RDS**, so `values-eks.yaml` sets `postgres.enabled=false` and keeps
+Redis and Kafka as StatefulSets. Reasons:
+- **Where the money is.** The ledger, idempotency keys and the transactional outbox are all in
+  Postgres. That's what needs managed backups, encryption at rest and a managed failover path.
+- **Redis is disposable.** It only holds rate-limit token buckets, which refill in seconds, and the
+  limiter fails open.
+- **Kafka is recoverable.** It's the real remaining weak spot: one broker on one EBS volume. But every
+  event is first committed to the outbox table in RDS, and the relay publishes from there.
+- **Managed versions need app work first.** The chart can already point at external endpoints
+  (`external.redisHost`, `external.kafkaBootstrapServers`), but only plaintext ones. ElastiCache with
+  in-transit encryption needs Redis TLS/AUTH settings, and MSK needs TLS or IAM auth
+  (`aws-msk-iam-auth`). The apps have neither yet.
+- **Cost and time.** Roughly +$0.05/h for ElastiCache and +$0.20/h or more for a 3-broker MSK, plus
+  20–30 min more on every apply and destroy.
+
+### Terraform layout
+- **Community modules where they save real work.** `terraform-aws-modules/vpc` 6.7.3,
+  `terraform-aws-modules/eks` 21.26.0 and `iam//iam-role-for-service-accounts` 6.8.2. RDS, ECR, S3,
+  Lambda and IAM are plain resources, which are easier to read and explain. Versions are pinned, and
+  `.terraform.lock.hcl` has hashes for linux_amd64 (CI), darwin_arm64 and darwin_amd64.
+- **Local state** (gitignored): one person, ephemeral stack. A team would use an S3 backend with locking.
+- **Tags:** provider `default_tags { project = "ledgerline" }`. Objects created later by Kubernetes
+  controllers are outside Terraform, so they are tagged by those controllers: LB controller
+  `defaultTags` and the StorageClass `tagSpecification_1`. `aws-down.sh` relies on those tags.
+- **VPC:** 2 AZs, pinned to `us-east-1a`/`us-east-1b` (`var.availability_zones`, validated to
+  belong to the region) rather than "the first two available", because us-east-1e supports neither
+  EKS control planes nor many current instance types. Private /19s (the VPC CNI gives every pod a VPC IP), public /24s, and **one** NAT
+  gateway. If that AZ fails, both AZs lose egress; that is an accepted cost trade-off. A free S3
+  gateway endpoint keeps ECR layer pulls and audit uploads off the NAT's per-GB charge.
+- **EKS 1.36** with `upgrade_policy.support_type = STANDARD`: at the end of standard support EKS
+  upgrades instead of silently billing extended support at 6× the price.
+  - No control-plane logs and no customer-managed KMS key (EKS envelope-encrypts Secrets with an
+    AWS-owned key by default). Both avoid idle costs, and the key would otherwise sit
+    "pending deletion" after every destroy.
+  - The v21 module doesn't install the self-managed add-ons, so `vpc-cni` and `kube-proxy`
+    (`before_compute`), `coredns`, and `aws-ebs-csi-driver` (IRSA role) are all declared.
+- **RDS:** `db.t4g.micro`, 20 GB gp3, encrypted, private, single-AZ, 1-day backups,
+  `skip_final_snapshot`, no deletion protection. That's the demo profile; production would use
+  Multi-AZ, longer backups, a final snapshot and deletion protection. The security group has **no
+  CIDR rules**: 5432 is open only to the EKS node security group (pods use their node's SG under the
+  VPC CNI) and the Lambda's security group.
+
+### Secrets: generated by Terraform, never in state, never in git
+- `ephemeral "random_password"`, written through **write-only arguments**:
+  - `aws_db_instance.password_wo`
+  - `aws_ssm_parameter.value_wo` → SecureStrings `/ledgerline/db/password`,
+    `/ledgerline/app/admin-password` and `/ledgerline/app/internal-service-token`
+  Terraform ≥ 1.11 never writes these values to `terraform.tfstate`. They're written once, in the
+  apply that creates them, and again only when `var.secrets_version` changes (rotation).
+- `aws-up.sh`, running with your credentials, reads them with `--with-decryption` and pipes them
+  straight into `kubectl create secret … --dry-run=client -o yaml | kubectl apply -f -`. Nothing
+  is printed or written to disk.
+  - If the values changed, it runs `rollout restart`: the chart's `checksum/secret` only covers
+    Secrets the chart creates itself.
+- The Lambda reads `/ledgerline/db/password` at runtime (least privilege: that one ARN). The GitHub
+  deploy role can read only `/ledgerline/deploy/*`, which holds the non-secret JDBC URL.
+- Rejected alternatives:
+  - **RDS-managed master password:** it rotates every 7 days by default, silently breaking the K8s Secret.
+  - **External Secrets Operator:** another controller and another IRSA role, for one Secret.
+  - **Secrets Manager:** $0.40 per secret per month, and nothing it offers is needed here.
+
+### GitHub OIDC: main branch of this repository only
+Trust policy: `aud = sts.amazonaws.com` **and** `sub = repo:garima24112000/ledgerline:ref:refs/heads/main`,
+both `StringEquals` with no wildcards.
+- PRs, other branches, tags and forks cannot assume the role, and neither can a job using a GitHub
+  `environment:` (its `sub` becomes `…:environment:<name>`). deploy.yml deliberately has no
+  environment.
+- **Permissions: exactly what deploy.yml does.**
+  - ECR push to the 4 repository ARNs (`GetAuthorizationToken` has to be `*`)
+  - `UpdateFunctionCode` / `GetFunction*` on one function
+  - `eks:DescribeCluster` on one cluster
+  - `ssm:GetParameter` on `/ledgerline/deploy/*`
+  - Nothing else: no IAM, EC2, RDS or S3, and no Terraform.
+- **Kubernetes permissions: RBAC, not an EKS access policy.** The first design associated
+  `AmazonEKSAdminPolicy` scoped to the namespace. AWS documents that access policies **don't cover
+  custom resources**, and the chart creates `ServiceMonitor`s. So:
+  - the access entry maps the role to the Kubernetes group `ledgerline-deployers`;
+  - a RoleBinding (`infra/k8s/eks/deployer-rbac.yaml`) binds that group to the built-in `admin`
+    ClusterRole in namespace `ledgerline` only;
+  - kube-prometheus-stack runs with `global.rbac.createAggregateClusterRoles=true`, which adds
+    `monitoring.coreos.com` to `admin`.
+
+  Result: CI can manage everything in one namespace, including ServiceMonitors, and nothing
+  cluster-scoped.
+
+### Public ALB safety: source CIDRs are required
+Phase 9 has no domain or ACM certificate, so the ALB is **plain HTTP**. API keys and the admin
+basic-auth password would cross the internet in clear text, so it must never be open to `0.0.0.0/0`.
+The restriction is enforced three times, so one forgotten step can't expose it:
+1. **Terraform** `ingress_allowed_cidrs`: required (no default), and validated as non-empty, valid
+   CIDRs with no `0.0.0.0/0` or `::/0`. It is also the single recorded value (output → GitHub variable).
+2. **deploy.yml** preflight: fails if `INGRESS_ALLOWED_CIDRS` is empty or open.
+3. **The chart:** `values-eks.yaml` sets `ingress.requireAllowedCidrs: true`, and the Ingress template
+   `fail`s on an empty or open list. It renders `alb.ingress.kubernetes.io/inbound-cidrs`, or
+   `nginx.ingress.kubernetes.io/whitelist-source-range` for className nginx. This also covers a
+   manual `helm upgrade`. The CIDRs are never committed in values files.
+
+The production fix is Route 53 + ACM + an HTTPS listener with an HTTP→HTTPS redirect.
+The Ingress `host` became optional (no host = match the ALB's own DNS name). With `host` set (kind),
+the rendered manifests are byte-identical to Phase 8.
+
+### Ingress on EKS: AWS Load Balancer Controller (ALB)
+- ingress-nginx is retired (March 2026). On EKS the LB controller turns the Ingress into an ALB with
+  `target-type: ip`: straight to pod IPs, health-checked on `/actuator/health/readiness`.
+- It runs with an IRSA role that has the module's LB controller policy.
+- Grafana gets **no** Ingress on EKS (`kubectl port-forward` only) and a random admin password.
+
+### gp3 StorageClass: explicit, never the default
+- New EKS clusters (1.30+) have no default StorageClass, and nothing provides `gp3` until the EBS CSI
+  driver is installed and a class is created.
+- `aws-up.sh` **inspects before it applies**:
+  - lists every class with its provisioner and default flag;
+  - creates `gp3` only if missing;
+  - skips an existing `ebs.csi.aws.com`/`type: gp3` class (StorageClass parameters are immutable, so
+    a blind re-apply could fail);
+  - fails loudly on any other `gp3`.
+- The new class is **not** default, and the cluster's existing default is never touched. Kafka asks
+  for `gp3` by name (`storageClass: gp3` in values-eks.yaml), and nothing else in the stack uses
+  PVCs (Prometheus uses emptyDir).
+
+### Sizing on 3 × c7i-flex.large
+Each node: 2 vCPU / 4 GiB, of which **~3.07 GiB and 1930m CPU are allocatable** (measured on the
+running cluster), so **~9.2 GiB in total**, and **29 pods per node** with the VPC CNI (no prefix
+delegation). Memory, not pod count, is the limit.
+The requests (gateway 1 Gi each, dispatcher 1 Gi, Kafka 1 Gi, bank/merchant 384 Mi, Prometheus
+512 Mi, plus system pods) leave room for 4 gateway replicas, not 6: `values-eks.yaml` caps the HPA
+at 4.
+
+### The ledger audit Lambda
+Runs nightly at 02:00 America/New_York (EventBridge Scheduler), or on demand with `aws lambda invoke`.
+- **Plain Java 21, no Spring.** `ledger-audit-lambda/pom.xml` deliberately has **no parent**:
+  `ledgerline-parent` injects `spring-boot-starter-web`, actuator and more into every module. The
+  module is still in the root `<modules>`, so `mvn verify` builds and tests it. Every Dockerfile
+  copies its `pom.xml`, because Maven reads the whole reactor even with `-pl`.
+  - Dependencies: `aws-lambda-java-core`, the Postgres driver, Jackson, and AWS SDK v2 S3 + SSM with
+    the URLConnection HTTP client (the Apache and Netty clients are excluded).
+  - The shaded jar is ~21 MB, well under Lambda's 50 MB direct-upload limit. Most of it is the S3 SDK.
+- **Isolated SQL, not shared code.** The four queries are copied from `LedgerRepository` rather than
+  shared, because depending on gateway-api would pull in Spring and Hibernate. Drift is caught by
+  `LedgerAuditorIT`, which runs **gateway-api's real Flyway migrations**
+  (`filesystem:../gateway-api/src/main/resources/db/migration`) on Testcontainers Postgres 16.
+- **One snapshot.** `run()` executes all four checks in one **read-only REPEATABLE READ** transaction.
+  Under READ COMMITTED, a payment committed between two checks could make them disagree.
+  `audit(Connection)` runs the checks inside whatever transaction the caller has, and never commits
+  or changes settings, which is what makes the unbalanced-entry test possible (below).
+- **Checks:**
+  1. Every journal entry balances. This also catches entries with **no postings**, which the Phase 2
+     `/admin/ledger/verify` query misses: it groups postings, so an entry without any never appears.
+  2. Every cached balance = credits − debits of its postings.
+  3. Global net = 0 **per currency**: summing INR and USD together would be meaningless.
+  4. No payment `UNKNOWN` for more than 60 minutes: `status = 'UNKNOWN' AND updated_at < now() - 60 min`.
+     `updated_at` is when it *became* UNKNOWN, which measures how long it has actually been
+     unresolved. `created_at` would wrongly flag a payment that was created hours ago but timed out
+     only minutes ago. It is also the key of `payments_unresolved_idx`.
+- **Report:** `s3://ledgerline-audit-<account>/audits/YYYY-MM-DD.json`, dated in America/New_York. The
+  report holds per-check pass/fail, exact violation counts and up to 100 example ids. A second run on
+  the same day overwrites it (the latest run wins).
+- **Metric without PutMetricData:** the handler prints one CloudWatch **Embedded Metric Format** line.
+  CloudWatch Logs extracts `Ledgerline/LedgerAuditFailures{FunctionName}` from it, so the role needs
+  no CloudWatch permission and makes no extra network call.
+- **Two alarms, because "the ledger is wrong" and "the audit didn't run" are different failures:**
+  - `LedgerAuditFailures ≥ 1`: the audit ran and a check failed. The invocation still succeeds and
+    the report is written.
+  - `AWS/Lambda Errors ≥ 1`: the handler threw (RDS unreachable, S3 denied, timeout). No report and no
+    metric are written, so this case is never mistaken for a clean ledger.
+  Both notify SNS `ledgerline-alerts`, with email only if `alert_email` is set.
+- **A stream handler** (`RequestStreamHandler`), so the response JSON is exactly what Jackson writes,
+  not whatever the runtime's own serializer does with records.
+- **Least-privilege role:**
+  - VPC ENI actions (`*`, which AWS requires)
+  - logs on its own log group only; the log group is created by Terraform with 14-day retention, so
+    it is destroyed with the stack
+  - `ssm:GetParameter` on one parameter
+  - `s3:PutObject` on `audits/*` only
+  The Scheduler has its own role: `lambda:InvokeFunction` on this function only, with
+  `aws:SourceAccount` in its trust policy.
+- **arm64 runtime** (cheaper), since the jar is architecture-neutral.
+- **No circular dependency between Terraform and CI:** Terraform owns the function's configuration,
+  CI owns its code.
+  - The first `terraform apply` uploads the jar `aws-up.sh` just built locally (bytecode, so the
+    laptop's CPU doesn't matter).
+  - `lifecycle.ignore_changes = [filename, source_code_hash]` stops later applies from reverting the
+    code that deploy.yml uploaded with `update-function-code`.
+  - `terraform validate` doesn't need the jar, so CI validates without building.
+
+#### Testing the audit
+- `LedgerAuditorIT`: each test gets its own database, `CREATE DATABASE … TEMPLATE` from one migrated
+  template, so committed test data never leaks and Flyway runs once.
+  - A clean ledger with a real balanced capture passes all four checks, dated 2026-09-28 for
+    2026-09-29T02:00Z (still the 28th in New York).
+  - A cached balance off by 1 fails `balances_match_postings` (that account) **and**
+    `global_net_zero` (`INR=1`).
+  - UNKNOWN payments: 61 min reported; 59 min not; created 3 h ago but UNKNOWN only 10 min not; FAILED
+    5 h ago not.
+  - **Unbalanced and empty entries can't be committed**: the deferred constraint triggers reject them
+    at COMMIT. The test therefore opens one connection with `autoCommit=false` and inserts a
+    one-sided entry and an entry with no postings. It calls `auditor.audit(sameConnection)` *before*
+    committing (deferred triggers haven't fired yet, and another connection couldn't see the rows),
+    asserts both ids are reported, then **rolls back**. A final `run()` proves the database is clean.
+    The production constraints are never weakened.
+- Unit tests (Mockito): the handler writes to `audits/<date>.json` and prints the EMF line; a
+  database error fails the invocation with no report and no metric; `S3ReportStore`'s bucket, key
+  and content type; SSM `withDecryption` and caching; `AuditConfig` defaults and fail-fast; EMF shape.
+
+#### EXPLAIN ANALYZE (`make explain-audit`, `infra/scripts/explain-audit.sql`)
+Measured on Postgres 16 with the 1M-payment seed, 2,000 UNKNOWN payments (1,000 older than an
+hour), and 100,000 balanced captures (300,000 postings):
+
+| Check | Plan | Time |
+|---|---|---|
+| entries_balanced | Merge Left Join: Index Only Scan `journal_entries_pkey` + Index Scan `postings_journal_entry_id_idx`, GroupAggregate | 247 ms |
+| balances_match_postings | Parallel Seq Scan on postings + HashAggregate, Merge Join with accounts | 27 ms |
+| global_net_zero | Seq Scan on accounts (6 rows) | 0.02 ms |
+| no_stale_unknown_payments | **Index Scan using `payments_unresolved_idx`**, `Index Cond: updated_at < now() - 1h`, `Filter: status = 'UNKNOWN'` | 0.45 ms |
+
+The three ledger checks are **full scans by design**: an audit has to read everything. That is the
+same trade-off as `/admin/ledger/verify`, and fine once a night; at 1M entries it scales roughly
+linearly, to ~2.5 s. The UNKNOWN check reads only the tiny partial index, however many payments exist.
+
+### CI/CD
+- **ci.yml** runs on pull requests and on pushes to any branch except main. It has four jobs:
+  - `mvn -B verify`: Testcontainers on `ubuntu-latest`'s Docker; surefire/failsafe reports are
+    uploaded even on failure.
+  - Helm lint/render for kind and EKS, plus renders that **must fail** (missing or open CIDRs).
+  - `terraform fmt -check` / `init -backend=false` / `validate`.
+  - shellcheck.
+- **deploy.yml** runs on pushes to main and on `workflow_dispatch`:
+  1. It first calls ci.yml (`workflow_call`), so main is tested exactly once, as the deploy gate.
+  2. Preflight checks the repository variables (and the CIDR rule) and is skipped while
+     `DEPLOY_ENABLED != true`, so pushes made while the stack is torn down don't go red.
+  3. A matrix of four image builds with `--platform linux/amd64` on GitHub's amd64 runners, tagged
+     with the full commit SHA. ECR tags are immutable, so a re-run skips images that already exist.
+  4. The Lambda job packages the jar and runs `update-function-code` + `wait function-updated-v2`.
+  5. `helm upgrade --install --atomic --wait` with the DB URL from SSM and the CIDRs from the variable.
+  - `concurrency: deploy-eks` without cancellation: a newer push waits rather than interrupting a rollout.
+- **No image is ever built on the laptop for EKS.** Apple Silicon produces arm64 images and the nodes
+  are amd64 (`exec format error`).
+
+### Bring-up and teardown
+- `aws-up.sh` runs, in order:
+  1. build the Lambda jar
+  2. `terraform apply`
+  3. kubeconfig (context `ledgerline-eks`), wait for nodes
+  4. gp3 inspection
+  5. LB controller → metrics-server → kube-prometheus-stack (pinned chart versions)
+  6. namespace + deployer RBAC → Secret from SSM
+  7. optionally GitHub variables and a deploy
+  Every step converges (apply, `upgrade --install`, `--dry-run | apply`), so re-runs are safe.
+- `aws-down.sh` is ordered so that **Kubernetes-created AWS resources disappear before the VPC does**:
+  1. `helm uninstall ledgerline` deletes the Ingress. The LB controller, *still running*, deletes the
+     ALB, target groups and its security groups, and its finalizer blocks until then.
+  2. It deletes the PVCs; StatefulSet volumes survive `helm uninstall`.
+  3. It deletes any other Ingress or LoadBalancer Service.
+  4. It **polls AWS** until no load balancer, target group or controller security group is left in
+     the VPC (10 min, then fail) and no PVC volume is left (5 min).
+  5. Only then does it uninstall the controllers. Uninstalling the LB controller first would orphan
+     the ALB, and its security group would block VPC deletion.
+  6. It empties ECR and S3 explicitly (`force_delete`/`force_destroy` are only backstops).
+  7. `terraform destroy`, retried once after 5 minutes: Lambda's VPC ENIs can take 20–40 minutes to
+     release and cause `DependencyViolation`.
+  8. It sets `DEPLOY_ENABLED=false`.
+  9. Verification: 20 checks by tag, name or VPC, from EKS/EC2/NAT/EIP/ELB/EBS/RDS (+ snapshots and
+     retained backups) to VPC/ECR/S3/Lambda/Scheduler/alarms/log groups/SSM, plus a tagging-API
+     catch-all (reported only, because it lags). A lookup that fails with anything other than "not
+     found" is a **FAIL**: "couldn't check" must never read as "gone". Any FAIL exits 1 with a
+     "TEARDOWN INCOMPLETE" banner.
+
+### Costs (approximate, us-east-1)
+~$0.21/h while up (about $5/day), **plus the EC2 cost of the 3 nodes**:
+
+| Resource | Cost |
+|---|---|
+| EKS control plane | $0.10/h |
+| 3 × c7i-flex.large | Not quoted: the on-demand c7i-flex.large price is not quoted here: this AWS account reported the type as Free Tier eligible during deployment, so free-tier usage or account credits may cover part or all of it |
+| NAT gateway | ~$0.045/h |
+| ALB | ~$0.023/h |
+| Public IPv4 | ~$0.015/h |
+| RDS micro | ~$0.02/h |
+| EBS, ECR, S3, CloudWatch, Lambda, Scheduler, SSM | cents |
+
+Hence session-sized use, `aws-down.sh`'s verification table, and a manual AWS Budget alert. Details
+in [DEPLOY.md](DEPLOY.md#costs).
+
+### Known limitations
+- HTTP only (no TLS); single NAT; single-AZ RDS; single Kafka broker; Redis/Kafka not managed.
+- `sslmode=require` encrypts but doesn't verify the RDS certificate (verify-full needs the RDS CA
+  bundle in the images).
+- The deploy role's Kubernetes access is RBAC in one namespace, so the add-ons (LB controller,
+  monitoring) can only be changed from the laptop (`aws-up.sh`).
+- Changing the Secret doesn't roll pods by itself; `aws-up.sh` restarts them when it changes the values.
+- Scheduler → Lambda is an asynchronous invoke, so a failed audit is retried by Lambda (twice by
+  default). Each failure still counts in the Errors alarm.
+
+### Deployment results (us-east-1)
+- **Region:** moved from ap-south-1 to **us-east-1** before the first apply, to be close to the
+  developer in the NYC area. The AZs are pinned to `us-east-1a`/`us-east-1b`, and the audit schedule
+  and report dates use America/New_York.
+- **The first `terraform plan` found two blockers, fixed before apply:**
+  - Output `database_url` comes from an SSM parameter value, which the AWS provider always marks
+    sensitive, so the output is now `sensitive = true`. deploy.yml also masks the value
+    (`::add-mask::`).
+  - The LB controller's IRSA role name is used as an IAM `name_prefix`, limited to 38 characters.
+    `ledgerline-aws-load-balancer-controller-` was 40, so the role is now `ledgerline-lbc`. Trust and
+    permissions are unchanged.
+- **The node group failed on t3.medium:**
+  - The first apply created everything up to the EKS managed node group, which ended in
+    **`CREATE_FAILED`**: this account (AWS Free plan) only allows Free Tier-eligible instance types,
+    and t3.medium isn't one.
+  - The types the account reported as eligible in us-east-1 were t8i.micro, t8i.small, t3.micro,
+    t3.small, t4g.micro, t4g.small, c7i-flex.large and m7i-flex.large.
+  - **c7i-flex.large** was chosen as the one matching t3.medium's 2 vCPU / 4 GiB on x86_64, so
+    `AL2023_x86_64_STANDARD` and the linux/amd64 images stay unchanged.
+- **Recovery:** Terraform had recorded the failed node group as **tainted**. The recovery plan was
+  exactly: replace the node group (`t3.medium → c7i-flex.large`, reusing the existing launch
+  template), and create the two add-ons that wait for nodes (`coredns`, `aws-ebs-csi-driver`).
+  **3 to add, 0 to change, 1 to destroy**, and nothing else touched.
+  - After the apply, all 3 nodes were Ready: 2 in us-east-1a, 1 in us-east-1b, amd64, Amazon Linux 2023.
+  - A second `terraform apply` reported 0 to add, 0 to change, 0 to destroy.
+  - Per node: 29 pods, ~3.07 GiB memory, 1930m CPU allocatable.
+
+### Testing (Phase 9)
+- `mvn -q clean verify`: all modules green, including the 11 new Lambda tests (7 unit, 4 integration).
+- The 4 Dockerfiles build with the new module in the reactor (natively, via `kind-up.sh`). mock-bank
+  was also built with `buildx --platform linux/amd64`, the way deploy.yml does it, and the image
+  reports `x86_64`.
+- Helm: kind renders **byte-identical** to Phase 8; the EKS render has no Postgres objects, `DB_URL` =
+  the RDS URL, ALB annotations with `inbound-cidrs`, no host, Kafka on `gp3`. Missing or open CIDRs,
+  or a missing DB URL, fail the render.
+- Terraform: `fmt -check`, `init -backend=false`, `validate`; variable validation rejects `[]`,
+  `0.0.0.0/0`, `::/0` and non-CIDRs (checked with `terraform console`). No `plan` or `apply` was run.
+- shellcheck and actionlint are clean.
+- kind regression (`kind-up.sh` + smoke test): a payment through the Ingress is CAPTURED, the
+  webhook is delivered, `/admin/ledger/verify` is consistent, and the Grafana datasource uid is
+  `prometheus`. Every RUNBOOK command (exec, SIGQUIT thread dump, jcmd in an ephemeral JDK
+  container, heap dump + `kubectl cp`, netshoot `ss`/`nslookup`/`dig`, the psql pod) was run on kind.
+- Verified on AWS so far: `terraform apply` (after the recovery above) is stable at 0/0/0, and 3 nodes
+  are Ready. The GitHub repository variables are set.
+- Not yet verified: deploy.yml (images, Lambda code, Helm), the ALB, RDS from the pods, the Lambda in
+  AWS, OIDC rejection from other branches, and aws-down.sh. That is the rest of the Phase 9
+  verification sequence.

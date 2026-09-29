@@ -1,0 +1,210 @@
+# Deploys main to EKS: CI -> 4 images (linux/amd64, tagged with the commit SHA) -> ECR, audit
+# Lambda code, then `helm upgrade --install` with values-eks.yaml.
+#
+# AWS access is GitHub OIDC -> the ledgerline-github-deploy role (infra/terraform/github-oidc.tf),
+# whose trust policy accepts only repo:<this repo>:ref:refs/heads/main. So:
+#   - no stored AWS keys;
+#   - workflow_dispatch from any other branch fails at "Configure AWS credentials";
+#   - no GitHub `environment:` here (it would change the token's sub claim and break the trust).
+#
+# Repository variables (Settings -> Secrets and variables -> Actions -> Variables), set by
+# `scripts/aws-up.sh --set-gh-vars`: AWS_REGION, AWS_ROLE_ARN, ECR_REGISTRY, EKS_CLUSTER_NAME,
+# LAMBDA_FUNCTION_NAME, INGRESS_ALLOWED_CIDRS, DEPLOY_ENABLED (false while the stack is torn down).
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One deploy at a time; a newer push waits instead of cancelling a half-finished rollout.
+concurrency:
+  group: deploy-eks
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REGISTRY: ${{ vars.ECR_REGISTRY }}
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  preflight:
+    name: Preflight
+    needs: ci
+    # While the stack is torn down (aws-down.sh sets DEPLOY_ENABLED=false) pushes skip the deploy
+    # instead of failing.
+    if: vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Required repository variables are set
+        env:
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+          EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
+          LAMBDA_FUNCTION_NAME: ${{ vars.LAMBDA_FUNCTION_NAME }}
+          INGRESS_ALLOWED_CIDRS: ${{ vars.INGRESS_ALLOWED_CIDRS }}
+        run: |
+          missing=0
+          for name in AWS_REGION AWS_ROLE_ARN ECR_REGISTRY EKS_CLUSTER_NAME LAMBDA_FUNCTION_NAME; do
+            if [ -z "${!name}" ]; then echo "::error::repository variable $name is not set"; missing=1; fi
+          done
+          # The ALB is plain HTTP: never expose it to the whole internet.
+          if [ -z "$INGRESS_ALLOWED_CIDRS" ]; then
+            echo "::error::INGRESS_ALLOWED_CIDRS is not set; refusing to expose an HTTP-only ALB"
+            missing=1
+          fi
+          case ",$INGRESS_ALLOWED_CIDRS," in
+            *",0.0.0.0/0,"* | *",::/0,"*)
+              echo "::error::INGRESS_ALLOWED_CIDRS must not contain 0.0.0.0/0 or ::/0 (HTTP-only ALB)"
+              missing=1 ;;
+          esac
+          exit $missing
+
+  images:
+    name: Image ${{ matrix.app }}
+    needs: preflight
+    runs-on: ubuntu-latest # amd64, like the c7i-flex.large (x86_64) nodes: no Apple Silicon (arm64) images
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write # OIDC token for AWS
+    strategy:
+      fail-fast: true
+      matrix:
+        app: [gateway-api, webhook-dispatcher, mock-bank, demo-merchant]
+    env:
+      IMAGE: ${{ vars.ECR_REGISTRY }}/ledgerline/${{ matrix.app }}:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: deploy-${{ matrix.app }}-${{ github.run_id }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      # Tags are immutable in ECR: a re-run of the same commit reuses the image it already pushed.
+      - name: Already pushed?
+        id: exists
+        run: |
+          if aws ecr describe-images --repository-name "ledgerline/${{ matrix.app }}" \
+               --image-ids imageTag="$IMAGE_TAG" >/dev/null 2>&1; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "$IMAGE already in ECR: skipping the build"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-buildx-action@v4
+        if: steps.exists.outputs.found == 'false'
+
+      - name: Build and push (linux/amd64)
+        if: steps.exists.outputs.found == 'false'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.app }}/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE }}
+          # A plain single-platform image manifest (no attestation index), easy to inspect in ECR.
+          provenance: false
+          cache-from: type=gha,scope=${{ matrix.app }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.app }}
+
+  lambda:
+    name: Audit Lambda code
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      # Tests already ran in the ci job.
+      - name: Package
+        run: mvn -B -ntp -pl ledger-audit-lambda -am package -DskipTests
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: deploy-lambda-${{ github.run_id }}
+
+      - name: Update function code
+        env:
+          FUNCTION: ${{ vars.LAMBDA_FUNCTION_NAME }}
+        run: |
+          aws lambda update-function-code --function-name "$FUNCTION" \
+            --zip-file fileb://ledger-audit-lambda/target/ledger-audit-lambda.jar \
+            --query '{sha256: CodeSha256, size: CodeSize}' --output table
+          aws lambda wait function-updated-v2 --function-name "$FUNCTION"
+
+  helm:
+    name: Helm upgrade
+    needs: [images, lambda]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: deploy-helm-${{ github.run_id }}
+
+      - uses: azure/setup-helm@v5
+        with:
+          version: v3.22.0
+
+      - name: kubeconfig
+        run: aws eks update-kubeconfig --name "${{ vars.EKS_CLUSTER_NAME }}" --region "$AWS_REGION"
+
+      # The namespace, the ledgerline-secrets Secret and the deployer RBAC come from scripts/aws-up.sh;
+      # this role is only admin of the ledgerline namespace, so there is no --create-namespace.
+      - name: helm upgrade --install
+        env:
+          INGRESS_ALLOWED_CIDRS: ${{ vars.INGRESS_ALLOWED_CIDRS }}
+        run: |
+          DB_URL="$(aws ssm get-parameter --name /ledgerline/deploy/database-url \
+                      --query Parameter.Value --output text)"
+          # Terraform treats it as sensitive: redact it should any tool ever print it.
+          echo "::add-mask::$DB_URL"
+          helm upgrade --install ledgerline infra/helm/ledgerline \
+            --namespace ledgerline \
+            -f infra/helm/ledgerline/values-eks.yaml \
+            --set image.repository="$ECR_REGISTRY/ledgerline" \
+            --set image.tag="$IMAGE_TAG" \
+            --set-string external.databaseUrl="$DB_URL" \
+            --set "ingress.allowedCidrs={$INGRESS_ALLOWED_CIDRS}" \
+            --atomic --wait --timeout 15m
+
+      - name: Status
+        if: always()
+        run: |
+          kubectl -n ledgerline get pods,hpa,ingress -o wide
+          echo "Gateway API: http://$(kubectl -n ledgerline get ingress ledgerline-gateway-api \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')/swagger-ui.html"

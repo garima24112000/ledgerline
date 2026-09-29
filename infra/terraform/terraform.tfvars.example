@@ -1,0 +1,19 @@
+# Copy to terraform.tfvars (gitignored) and fill in.
+
+# REQUIRED. Who may reach the HTTP-only ALB. Your public IP as /32:
+#   curl -s https://checkip.amazonaws.com
+ingress_allowed_cidrs = ["203.0.113.7/32"]
+
+# Set to false if `aws iam list-open-id-connect-providers` already shows token.actions.githubusercontent.com.
+create_github_oidc_provider = true
+
+# Optional: email for the ledger audit alarms (confirm the subscription email AWS sends).
+alert_email = ""
+
+# Defaults, shown for reference:
+# region             = "us-east-1"
+# availability_zones = ["us-east-1a", "us-east-1b"]
+# audit_timezone     = "America/New_York"
+# kubernetes_version = "1.36"
+# github_repository  = "garima24112000/ledgerline"
+# github_branch      = "main"

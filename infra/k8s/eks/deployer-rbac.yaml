@@ -1,0 +1,23 @@
+# What the GitHub Actions deploy role may do in Kubernetes: everything the built-in "admin" role
+# allows, in the ledgerline namespace only (no cluster-scoped objects, no other namespaces).
+# The IAM role is mapped to the group "ledgerline-deployers" by its EKS access entry
+# (infra/terraform/eks.tf). "admin" includes ServiceMonitors because kube-prometheus-stack is
+# installed with global.rbac.createAggregateClusterRoles=true.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ledgerline
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ledgerline-deployers-admin
+  namespace: ledgerline
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: ledgerline-deployers
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: admin

@@ -1,29 +1,49 @@
 # =============================================================================================
-# EKS - PHASE 8 SCAFFOLDING, NOT THE FINAL EKS ARCHITECTURE.
+# EKS (Phase 9): the cluster, RDS, ECR and the rest come from infra/terraform.
 #
-# This renders and installs on EKS, but it still runs Postgres, Redis and Kafka as in-cluster
-# StatefulSets, only because the Terraform that creates the managed services doesn't exist yet.
-# Phase 9 (Terraform) switches EKS to Amazon RDS, ElastiCache and MSK: set postgres/redis/kafka
-# .enabled=false and fill in external.* (see the commented block at the bottom).
+#   Postgres  -> Amazon RDS for PostgreSQL 16 (postgres.enabled=false, external.databaseUrl).
+#   Redis     -> STILL an in-cluster StatefulSet. Demo scaffolding, not the production design.
+#   Kafka     -> STILL an in-cluster StatefulSet (1 broker, gp3 EBS volume). Demo scaffolding.
+#
+# Why Redis and Kafka stay in-cluster: Phase 9 provisions only RDS. ElastiCache and MSK would also
+# need app changes (Redis TLS/AUTH, Kafka TLS or IAM auth), which the chart and apps don't have yet.
+# The money lives in RDS: the ledger, and the outbox that can republish every event to Kafka.
+# See docs/DESIGN.md, "AWS (Phase 9)".
+#
+# Set by .github/workflows/deploy.yml on every deploy (never committed here):
+#   image.repository, image.tag, external.databaseUrl, ingress.allowedCidrs
 # =============================================================================================
 
-# Images pushed to ECR. Build for the node architecture (e.g. docker buildx --platform linux/amd64
-# on an Apple Silicon laptop), then push <repository>/<app>:<tag>.
+# Pushed by deploy.yml as <registry>/ledgerline/<app>:<git sha>, built on GitHub's amd64 runners.
 image:
-  repository: <account-id>.dkr.ecr.<region>.amazonaws.com/ledgerline
-  tag: "0.1.0"
+  repository: set-by-deploy # <account-id>.dkr.ecr.us-east-1.amazonaws.com/ledgerline
+  tag: set-by-deploy        # the git commit SHA
   pullPolicy: IfNotPresent
 
-# Created outside Helm (e.g. from AWS Secrets Manager with External Secrets), with the keys
-# DB_PASSWORD, ADMIN_PASSWORD, INTERNAL_SERVICE_TOKEN. The chart creates no Secret.
+# Created by scripts/aws-up.sh from SSM SecureStrings that Terraform wrote. Keys DB_PASSWORD,
+# ADMIN_PASSWORD, INTERNAL_SERVICE_TOKEN. The chart creates no Secret. Changing it does not roll the
+# pods (the checksum only covers chart-made Secrets): kubectl -n ledgerline rollout restart deploy.
 secrets:
   existingSecret: ledgerline-secrets
 
-storageClass: gp3 # EBS CSI driver StorageClass
+# Non-default StorageClass created by scripts/aws-up.sh (EBS CSI driver, gp3, encrypted).
+# Only Kafka's volume uses it.
+storageClass: gp3
 
+# AWS Load Balancer Controller -> an internet-facing ALB. Plain HTTP: there is no domain or ACM
+# certificate in Phase 9, so the ALB only accepts the source CIDRs in allowedCidrs, and the chart
+# refuses to render without them (or with 0.0.0.0/0). Production fix: Route 53 + ACM + HTTPS listener.
 ingress:
-  className: nginx
-  host: api.ledgerline.example.com
+  className: alb
+  host: "" # no domain: match the ALB's own DNS name
+  requireAllowedCidrs: true
+  allowedCidrs: [] # deploy.yml: --set "ingress.allowedCidrs={<your-ip>/32}" from vars.INGRESS_ALLOWED_CIDRS
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip # straight to pod IPs (VPC CNI), no NodePort hop
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    alb.ingress.kubernetes.io/healthcheck-path: /actuator/health/readiness
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "10"
 
 gatewayApi:
   resources:
@@ -31,29 +51,39 @@ gatewayApi:
     limits: { cpu: "2", memory: 1536Mi }
   hpa:
     minReplicas: 2
-    maxReplicas: 6
+    # 4, not 6: 3 x c7i-flex.large have ~9.2 GiB allocatable in total, shared with Kafka, the other apps
+    # and monitoring. 6 gateway pods at 1 GiB each would sit Pending.
+    maxReplicas: 4
 
 webhookDispatcher:
   resources:
     requests: { cpu: 500m, memory: 1Gi }
     limits: { cpu: "2", memory: 1536Mi }
 
+# --- Postgres: Amazon RDS ----------------------------------------------------------------------
 postgres:
-  storage: 20Gi
+  enabled: false
+  # Still the source of DB_USERNAME for the apps: must equal the RDS master username (rds.tf).
+  username: ledgerline
 
+external:
+  # Set by deploy.yml from SSM /ledgerline/deploy/database-url, e.g.
+  # jdbc:postgresql://ledgerline.xxxx.us-east-1.rds.amazonaws.com:5432/ledgerline?sslmode=require
+  # Left empty here, so a deploy without it fails at render time ("external.databaseUrl is required").
+  databaseUrl: ""
+
+# --- Redis and Kafka: still in-cluster (see header) ---------------------------------------------
 kafka:
-  storage: 20Gi
+  storage: 10Gi
 
-# --- Phase 9: managed services (uncomment once Terraform creates them) ---------------------------
-# postgres:
-#   enabled: false
+# --- Future, NOT Phase 9: ElastiCache and MSK ------------------------------------------------------
+# Needs Terraform for both, plus app support for Redis TLS/AUTH and Kafka TLS/IAM first.
 # redis:
 #   enabled: false
 # kafka:
 #   enabled: false
 # external:
-#   databaseUrl: jdbc:postgresql://<rds-endpoint>:5432/ledgerline
 #   redisHost: <elasticache-primary-endpoint>
-#   kafkaBootstrapServers: <msk-broker-1>:9092,<msk-broker-2>:9092,<msk-broker-3>:9092
+#   kafkaBootstrapServers: <msk-broker-1>:9094,<msk-broker-2>:9094,<msk-broker-3>:9094
 # config:
 #   kafkaReplicationFactor: 3
